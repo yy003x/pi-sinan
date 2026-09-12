@@ -55,6 +55,28 @@ Default provider is `auto`: xAI if configured, otherwise OpenAI API key.
 
 Default output: `generated-images/<timestamp>.png` under the current workspace.
 
+### Show in the conversation
+
+By default the PNG is also shown in the main chat (tool result for `generate_image`, custom entry for `/image`). This needs a terminal with inline images (Kitty, iTerm2, or `PI_IMAGE_PROTOCOL`). Turn it off to save context and skip the preview:
+
+```json
+{
+  "piAccess": {
+    "image": {
+      "showInConversation": false
+    }
+  }
+}
+```
+
+Or:
+
+```text
+/image config off
+/image config on
+/image a cat --no-preview
+```
+
 ## Gallery / npm
 
 The official [pi.dev/packages](https://pi.dev/packages) catalog only lists npm packages with the `pi-package` keyword. This git install path does not require an npm account. If you later publish `npm:pi-access`, keep this repo as the multi-extension source; do not split each extension into a separate unique product unless it outgrows the package.
