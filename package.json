@@ -29,11 +29,13 @@
   },
   "files": [
     "extensions/",
+    "src/",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "check": "npm pack --dry-run"
+    "check": "npm pack --dry-run",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

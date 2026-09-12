@@ -4,7 +4,8 @@
  * OpenAI Codex ChatGPT OAuth cannot call the Images API.
  * This file is one extension in a multi-extension package, not a standalone product.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
@@ -15,7 +16,8 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Box, Image, Text } from "@earendil-works/pi-tui";
+import { Text, getImageDimensions } from "@earendil-works/pi-tui";
+import { createImageCardRenderer, createPreview, normalizePng, type ImageCardData } from "../src/image-preview.ts";
 
 const XAI_DEFAULT_MODEL = "grok-imagine-image-2.0";
 const XAI_MODELS = new Set([
@@ -237,6 +239,8 @@ async function generate(input: {
 		}, input.signal);
 		bytes = await decodeImage(parsed);
 	}
+	// Providers may return JPEG even when the requested output path ends in .png.
+	bytes = await normalizePng(bytes);
 	await withFileMutationQueue(input.path, async () => {
 		await mkdir(dirname(input.path), { recursive: true, mode: 0o700 });
 		await writeFile(input.path, bytes, { mode: 0o600 });
@@ -279,7 +283,24 @@ function parseCommand(args: string): {
 	};
 }
 
-const generateImageTool = defineTool({
+async function cardData(result: GeneratedImage, preview: boolean): Promise<ImageCardData> {
+	const size = getImageDimensions(result.dataBase64, "image/png");
+	if (!size) throw new Error("Cannot determine saved PNG dimensions");
+	return {
+		id: randomUUID(), path: result.path, provider: result.provider, model: result.model,
+		bytes: result.bytes, width: size.widthPx, height: size.heightPx,
+		showInConversation: preview,
+		...(preview ? { preview: await createPreview(Buffer.from(result.dataBase64, "base64")) } : {}),
+	};
+}
+
+export default function (pi: ExtensionAPI) {
+	const cards = createImageCardRenderer(() => showInConversation());
+	pi.on("session_start", () => cards.reset());
+	pi.on("session_tree", () => cards.reset());
+	pi.on("session_shutdown", () => cards.reset());
+
+	const generateImageTool = defineTool({
 	name: "generate_image",
 	label: "Generate Image",
 	description: "Generate one image with the signed-in xAI SuperGrok/X Premium subscription or an OpenAI API key, then save a PNG in the workspace. ChatGPT/Codex OAuth cannot generate images.",
@@ -289,7 +310,8 @@ const generateImageTool = defineTool({
 		"generate_image uses existing Pi login: xAI subscription/API key, or OpenAI API key. Do not ask for a new key if those are configured.",
 		"OpenAI Codex/ChatGPT OAuth cannot generate images. Do not switch to gpt-6-astra hoping it will emit a PNG.",
 		"After generate_image succeeds, report the saved path and which provider produced it.",
-		"generate_image may attach the PNG in the conversation when piAccess.image.showInConversation is true; do not set show_in_conversation unless the user asked to override that setting.",
+		"generate_image shows a thumbnail card when piAccess.image.showInConversation is true; do not set show_in_conversation unless the user asked to override that setting.",
+		"generate_image returns file metadata, not image content to the model. Read the saved image only when visual inspection is needed.",
 	],
 	parameters: Type.Object({
 		prompt: Type.String({ description: "Image prompt" }),
@@ -313,29 +335,23 @@ const generateImageTool = defineTool({
 		});
 		const preview = showInConversation(params.show_in_conversation);
 		const summary = `Generated with ${result.provider}/${result.model}: ${result.path} (${result.bytes} bytes)`;
-		return {
-			content: preview
-				? [
-					{ type: "text" as const, text: summary },
-					{ type: "image" as const, data: result.dataBase64, mimeType: "image/png" },
-				]
-				: [{ type: "text" as const, text: summary }],
-			details: { path: result.path, provider: result.provider, model: result.model, bytes: result.bytes, showInConversation: preview },
-		};
+		const details = await cardData(result, preview);
+		cards.markLive(details);
+		return { content: [{ type: "text" as const, text: summary }], details };
+	},
+	renderResult(result, { expanded, isPartial }, theme, context) {
+		const data = result.details as ImageCardData | undefined;
+		if (isPartial || !data?.path) {
+			return new Text(result.content.filter((c) => c.type === "text").map((c) => c.text).join("\n"), 0, 0);
+		}
+		return cards.render(data, expanded, theme, context.showImages);
 	},
 });
 
-export default function (pi: ExtensionAPI) {
 	pi.registerTool(generateImageTool);
-	pi.registerEntryRenderer<{ path: string; provider: string; model: string }>(ENTRY_TYPE, (entry, _opts, theme) => {
-		const data = entry.data ?? { path: "", provider: "xai", model: "" };
-		const box = new Box(0, 0);
-		box.addChild(new Text(`${theme.fg("accent", "[image]")} ${data.provider}/${data.model} ${data.path}`, 0, 0));
-		if (showInConversation() && data.path && existsSync(data.path)) {
-			const dataBase64 = readFileSync(data.path).toString("base64");
-			box.addChild(new Image(dataBase64, "image/png", { fallbackColor: (s) => theme.fg("dim", s) }));
-		}
-		return box;
+	pi.registerEntryRenderer<ImageCardData>(ENTRY_TYPE, (entry, { expanded }, theme) => {
+		if (!entry.data?.path) return new Text("[image] Missing file path", 0, 0);
+		return cards.render(entry.data, expanded, theme);
 	});
 	pi.registerCommand("image", {
 		description: "Generate an image: /image <prompt> [--path file.png] [--aspect 16:9] [--provider xai|openai] [--preview|--no-preview]. /image config [on|off|dir <path>] configures preview and output directory.",
@@ -377,10 +393,10 @@ export default function (pi: ExtensionAPI) {
 					ctx,
 				});
 				const preview = showInConversation(parsed.preview);
-				if (preview) {
-					pi.appendEntry(ENTRY_TYPE, { path: result.path, provider: result.provider, model: result.model });
-				}
-				ctx.ui.notify(`Saved ${result.path} (${result.provider}/${result.model})${preview ? " · shown in chat" : ""}`, "success");
+				const data = await cardData(result, preview);
+				cards.markLive(data);
+				pi.appendEntry(ENTRY_TYPE, data);
+				ctx.ui.notify(`Saved ${result.path} (${result.provider}/${result.model})`, "success");
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}

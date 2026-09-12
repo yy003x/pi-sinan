@@ -53,7 +53,7 @@ Disable one resource without removing the package:
 
 Default provider is `auto`: xAI if configured, otherwise OpenAI API key.
 
-Default output: `.pi-images/<timestamp>.png` under the current workspace. Change it with `/image config dir <path>` or:
+Default output: `.pi-images/<timestamp>.png` under the current workspace. Generated files are always PNG; xAI JPEG payloads are converted before writing. Change the directory with `/image config dir <path>` or:
 
 ```json
 {
@@ -67,7 +67,7 @@ Default output: `.pi-images/<timestamp>.png` under the current workspace. Change
 
 ### Show in the conversation
 
-By default the PNG is also shown in the main chat (tool result for `generate_image`, custom entry for `/image`). This needs a terminal with inline images (Kitty, iTerm2, or `PI_IMAGE_PROTOCOL`). Turn it off to save context and skip the preview:
+By default a bounded thumbnail card is shown in the main chat (`generate_image` and `/image`). The original file is linked, not sent to the model. Newly generated cards are visible immediately; restored history stays collapsed until you expand it. This needs a terminal with inline images (Kitty, iTerm2, or `PI_IMAGE_PROTOCOL`). Turn it off to skip the thumbnail:
 
 ```json
 {
