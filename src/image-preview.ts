@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { convertToPng, type Theme } from "@earendil-works/pi-coding-agent";
-import { Box, Image, Text, getCapabilities, getImageDimensions, hyperlink } from "@earendil-works/pi-tui";
+import { Box, Image, Text, getCapabilities, getCellDimensions, getImageDimensions, hyperlink } from "@earendil-works/pi-tui";
 
 const MAX_ORIGINAL_BYTES = 8 * 1024 * 1024;
 const MAX_CACHE_BYTES = 16 * 1024 * 1024;
@@ -30,6 +30,19 @@ export function imageMimeType(bytes: Uint8Array): string {
 	if (/^GIF8[79]a$/.test(b.toString("ascii", 0, 6))) return "image/gif";
 	if (b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") return "image/webp";
 	throw new Error("Image response is not a supported PNG, JPEG, GIF or WebP file");
+}
+
+/** Cell box that can hold the original pixels without upscaling. Terminal cells cannot be smaller than 1. */
+export function originalDisplayCells(
+	size: { widthPx: number; heightPx: number },
+	cell = getCellDimensions(),
+) {
+	const cellW = Math.max(1, cell.widthPx);
+	const cellH = Math.max(1, cell.heightPx);
+	return {
+		maxWidthCells: Math.max(1, Math.floor(size.widthPx / cellW)),
+		maxHeightCells: Math.max(1, Math.floor(size.heightPx / cellH)),
+	};
 }
 
 function dimensions(image: OriginalImage) {
@@ -111,8 +124,7 @@ export function createImageCardRenderer(defaultPreview: () => boolean) {
 				const size = dimensions({ ...image, mimeType: actualMime });
 				if (getCapabilities().images === "kitty" && actualMime !== "image/png") throw new Error("PNG required");
 				box.addChild(new Image(image.data, actualMime, { fallbackColor: (s) => theme.fg("dim", s) }, {
-					maxWidthCells: 1000,
-					maxHeightCells: 1000,
+					...originalDisplayCells(size),
 					filename: data.path,
 				}, size));
 			} catch {

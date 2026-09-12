@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getImageDimensions, getPngDimensions, resetCapabilitiesCache, setCapabilityOverrides } from "@earendil-works/pi-tui";
-import { createImageCardRenderer, imageMimeType, normalizePng, type ImageCardData } from "../src/image-preview.ts";
+import { createImageCardRenderer, imageMimeType, normalizePng, originalDisplayCells, type ImageCardData } from "../src/image-preview.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const PNG = readFileSync(join(fixtures, "1x1.png"));
@@ -64,20 +64,15 @@ test("per-entry preview override is independent of the global default", () => {
 	assert.doesNotMatch(cards.render(data, false, theme() as never).render(80).join("\n"), /Ctrl\+O to expand image/);
 });
 
-test("expanded original image is not height-capped to a thumbnail", () => {
-	const path = writeCard(PNG, "original.png");
-	const cards = createImageCardRenderer(() => true);
-	const data: ImageCardData = { id: "orig", path, provider: "xai", model: "grok", showInConversation: true };
-	cards.markLive(data);
-	resetCapabilitiesCache();
-	setCapabilityOverrides({ images: "iterm2" });
-	try {
-		const lines = cards.render(data, false, theme() as never).render(80);
-		assert.ok(lines.some((line) => line.includes("1337;File=") || line.includes(path)));
-		assert.doesNotMatch(lines.join("\n"), /Ctrl\+O to expand image/);
-	} finally {
-		resetCapabilitiesCache();
-	}
+test("display cells never upscale original pixels", () => {
+	const cell = { widthPx: 9, heightPx: 18 };
+	const size = { widthPx: 720, heightPx: 1280 };
+	const limits = originalDisplayCells(size, cell);
+	assert.deepEqual(limits, { maxWidthCells: 80, maxHeightCells: 71 });
+	assert.ok(limits.maxWidthCells * cell.widthPx <= size.widthPx);
+	assert.ok(limits.maxHeightCells * cell.heightPx <= size.heightPx);
+	const wideTerminal = Math.min(200, limits.maxWidthCells);
+	assert.equal(wideTerminal, 80);
 });
 
 test("legacy JPEG files are not rewritten", () => {

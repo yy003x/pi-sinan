@@ -67,7 +67,7 @@ Default output: `.pi-images/<timestamp>.png` under the current workspace. Genera
 
 ### Show in the conversation
 
-By default the original image is shown in the main chat (`generate_image` and `/image`). The file is linked, not sent to the model. Newly generated cards are visible immediately; restored history stays collapsed until you expand it with Ctrl+O. This needs a terminal with inline images (Kitty, iTerm2, or `PI_IMAGE_PROTOCOL`). Turn it off to skip the inline image:
+By default the original image is shown in the main chat (`generate_image` and `/image`) at native pixel size. It may shrink to fit a narrower terminal, but it is never upscaled. The file is linked, not sent to the model. Newly generated cards are visible immediately; restored history stays collapsed until you expand it with Ctrl+O. This needs a terminal with inline images (Kitty, iTerm2, or `PI_IMAGE_PROTOCOL`). Turn it off to skip the inline image:
 
 ```json
 {
