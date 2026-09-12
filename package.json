@@ -1,0 +1,43 @@
+{
+  "name": "pi-access",
+  "version": "0.1.0",
+  "description": "Pi extensions that reuse accounts you already have. Image generation is one extension; more can be added under extensions/.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension"
+  ],
+  "license": "MIT",
+  "author": "yy003x",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yy003x/pi-access.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yy003x/pi-access/issues"
+  },
+  "homepage": "https://github.com/yy003x/pi-access#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
