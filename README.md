@@ -53,7 +53,17 @@ Disable one resource without removing the package:
 
 Default provider is `auto`: xAI if configured, otherwise OpenAI API key.
 
-Default output: `generated-images/<timestamp>.png` under the current workspace.
+Default output: `.pi/pi-images/<timestamp>.png` under the current workspace. Change it with `/image config dir <path>` or:
+
+```json
+{
+  "piAccess": {
+    "image": {
+      "outputDir": ".pi/pi-images"
+    }
+  }
+}
+```
 
 ### Show in the conversation
 
@@ -74,6 +84,7 @@ Or:
 ```text
 /image config off
 /image config on
+/image config dir .pi/pi-images
 /image a cat --no-preview
 ```
 

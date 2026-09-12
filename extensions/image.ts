@@ -38,8 +38,11 @@ type ProviderId = "xai" | "openai";
 const SETTINGS_KEY = "piAccess";
 const ENTRY_TYPE = "pi-access-image";
 
+const DEFAULT_OUTPUT_DIR = ".pi/pi-images";
+
 interface ImageAccessSettings {
 	showInConversation?: boolean;
+	outputDir?: string;
 }
 
 interface GeneratedImage {
@@ -58,7 +61,11 @@ function readImageSettings(): ImageAccessSettings {
 		const image = (root as Record<string, unknown>).image;
 		if (!image || typeof image !== "object" || Array.isArray(image)) return {};
 		const show = (image as Record<string, unknown>).showInConversation;
-		return typeof show === "boolean" ? { showInConversation: show } : {};
+		const outputDir = (image as Record<string, unknown>).outputDir;
+		return {
+			...(typeof show === "boolean" ? { showInConversation: show } : {}),
+			...(typeof outputDir === "string" && outputDir.trim() ? { outputDir: outputDir.trim() } : {}),
+		};
 	} catch {
 		return {};
 	}
@@ -70,7 +77,7 @@ function showInConversation(override?: boolean): boolean {
 	return value !== false;
 }
 
-function writeShowInConversation(enabled: boolean): void {
+function writeImageSettings(patch: ImageAccessSettings): void {
 	const path = join(getAgentDir(), "settings.json");
 	const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 	const root = raw[SETTINGS_KEY] && typeof raw[SETTINGS_KEY] === "object" && !Array.isArray(raw[SETTINGS_KEY])
@@ -79,10 +86,22 @@ function writeShowInConversation(enabled: boolean): void {
 	const image = root.image && typeof root.image === "object" && !Array.isArray(root.image)
 		? { ...(root.image as Record<string, unknown>) }
 		: {};
-	image.showInConversation = enabled;
+	if (patch.showInConversation !== undefined) image.showInConversation = patch.showInConversation;
+	if (patch.outputDir !== undefined) image.outputDir = patch.outputDir;
 	root.image = image;
 	raw[SETTINGS_KEY] = root;
 	writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+}
+
+function workspaceDir(cwd: string, dir: string): string {
+	const trimmed = dir.trim().replace(/^@/, "");
+	if (!trimmed || trimmed.includes("\0")) throw new Error("outputDir must be a non-empty path");
+	const resolved = isAbsolute(trimmed) ? resolve(trimmed) : resolve(cwd, trimmed);
+	const root = resolve(cwd);
+	if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+		throw new Error("outputDir must stay inside the current workspace");
+	}
+	return resolved;
 }
 
 function stamp(): string {
@@ -92,9 +111,9 @@ function stamp(): string {
 }
 
 function outputPath(cwd: string, path?: string): string {
-	const raw = (path ?? `generated-images/${stamp()}.png`).trim().replace(/^@/, "");
+	const raw = (path ?? join(readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR, `${stamp()}.png`)).trim().replace(/^@/, "");
 	if (!raw) throw new Error("output path must not be empty");
-	const resolved = isAbsolute(raw) ? raw : resolve(cwd, raw);
+	const resolved = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
 	const root = resolve(cwd);
 	if (resolved !== root && !resolved.startsWith(`${root}/`)) {
 		throw new Error("output path must stay inside the current workspace");
@@ -274,7 +293,7 @@ const generateImageTool = defineTool({
 	],
 	parameters: Type.Object({
 		prompt: Type.String({ description: "Image prompt" }),
-		path: Type.Optional(Type.String({ description: "Workspace-relative PNG path. Default: generated-images/<timestamp>.png" })),
+		path: Type.Optional(Type.String({ description: "Workspace-relative PNG path. Default: .pi/pi-images/<timestamp>.png" })),
 		aspect_ratio: Type.Optional(Type.String({ description: "Optional aspect ratio such as 1:1, 16:9, 9:16, auto" })),
 		provider: Type.Optional(Type.String({ description: "xai, openai, or auto (default auto)" })),
 		model: Type.Optional(Type.String({ description: "Provider image model override" })),
@@ -319,17 +338,29 @@ export default function (pi: ExtensionAPI) {
 		return box;
 	});
 	pi.registerCommand("image", {
-		description: "Generate an image: /image <prompt> [--path file.png] [--aspect 16:9] [--provider xai|openai] [--preview|--no-preview]. /image config [on|off] toggles conversation preview.",
+		description: "Generate an image: /image <prompt> [--path file.png] [--aspect 16:9] [--provider xai|openai] [--preview|--no-preview]. /image config [on|off|dir <path>] configures preview and output directory.",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "config" || trimmed.startsWith("config ")) {
 				const rest = trimmed.slice("config".length).trim();
 				if (rest === "on" || rest === "off") {
-					writeShowInConversation(rest === "on");
+					writeImageSettings({ showInConversation: rest === "on" });
 					ctx.ui.notify(`piAccess.image.showInConversation = ${rest === "on"}`, "success");
 					return;
 				}
-				ctx.ui.notify(`piAccess.image.showInConversation = ${showInConversation()} (default true). /image config on|off`, "info");
+				if (rest.startsWith("dir ") || rest === "dir") {
+					const dir = rest.slice("dir".length).trim();
+					if (!dir) {
+						ctx.ui.notify(`piAccess.image.outputDir = ${readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR}`, "info");
+						return;
+					}
+					workspaceDir(ctx.cwd, dir);
+					writeImageSettings({ outputDir: dir });
+					ctx.ui.notify(`piAccess.image.outputDir = ${dir}`, "success");
+					return;
+				}
+				const currentDir = readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR;
+				ctx.ui.notify(`showInConversation=${showInConversation()} outputDir=${currentDir}. /image config on|off|dir <path>`, "info");
 				return;
 			}
 			const parsed = parseCommand(trimmed);
