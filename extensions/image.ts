@@ -38,7 +38,7 @@ type ProviderId = "xai" | "openai";
 const SETTINGS_KEY = "piAccess";
 const ENTRY_TYPE = "pi-access-image";
 
-const DEFAULT_OUTPUT_DIR = ".pi/pi-images";
+const DEFAULT_OUTPUT_DIR = ".pi-images";
 
 interface ImageAccessSettings {
 	showInConversation?: boolean;
@@ -293,7 +293,7 @@ const generateImageTool = defineTool({
 	],
 	parameters: Type.Object({
 		prompt: Type.String({ description: "Image prompt" }),
-		path: Type.Optional(Type.String({ description: "Workspace-relative PNG path. Default: .pi/pi-images/<timestamp>.png" })),
+		path: Type.Optional(Type.String({ description: "Workspace-relative PNG path. Default: .pi-images/<timestamp>.png" })),
 		aspect_ratio: Type.Optional(Type.String({ description: "Optional aspect ratio such as 1:1, 16:9, 9:16, auto" })),
 		provider: Type.Optional(Type.String({ description: "xai, openai, or auto (default auto)" })),
 		model: Type.Optional(Type.String({ description: "Provider image model override" })),
