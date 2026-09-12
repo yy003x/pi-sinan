@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getImageDimensions, getPngDimensions, resetCapabilitiesCache, setCapabilityOverrides } from "@earendil-works/pi-tui";
-import { createImageCardRenderer, createPreview, imageMimeType, normalizePng, type ImageCardData } from "../src/image-preview.ts";
+import { createImageCardRenderer, imageMimeType, normalizePng, type ImageCardData } from "../src/image-preview.ts";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
 const PNG = readFileSync(join(fixtures, "1x1.png"));
@@ -13,6 +13,13 @@ const JPEG = readFileSync(join(fixtures, "tiny.jpg"));
 
 function theme() {
 	return { fg: (_: string, s: string) => s, bg: (_: string, s: string) => s, dim: (s: string) => s, italic: (s: string) => s, strikethrough: (s: string) => s };
+}
+
+function writeCard(bytes: Buffer, name: string) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-access-"));
+	const path = join(dir, name);
+	writeFileSync(path, bytes);
+	return path;
 }
 
 test("imageMimeType reads bytes, not filenames", () => {
@@ -33,20 +40,11 @@ test("normalizePng converts JPEG and leaves PNG bytes unchanged", async () => {
 	assert.deepEqual(await normalizePng(PNG), PNG);
 });
 
-test("createPreview stays within the thumbnail budget", async () => {
-	const preview = await createPreview(JPEG);
-	assert.ok(preview);
-	assert.equal(imageMimeType(Buffer.from(preview.data, "base64")), "image/png");
-	assert.ok(preview.data.length <= 192 * 1024);
-	const size = getImageDimensions(preview.data, "image/png");
-	assert.ok(size && size.widthPx <= 480 && size.heightPx <= 240);
-});
-
 test("new cards stay visible until collapsed, restored history stays collapsed", () => {
+	const path = writeCard(PNG, "live.png");
 	const cards = createImageCardRenderer(() => true);
 	const data: ImageCardData = {
-		id: "live", path: "/tmp/live.png", provider: "xai", model: "grok",
-		showInConversation: true, preview: { data: PNG.toString("base64"), mimeType: "image/png" },
+		id: "live", path, provider: "xai", model: "grok", showInConversation: true,
 	};
 	cards.markLive(data);
 	assert.doesNotMatch(cards.render(data, false, theme() as never).render(80).join("\n"), /Ctrl\+O to expand image/);
@@ -57,29 +55,33 @@ test("new cards stay visible until collapsed, restored history stays collapsed",
 });
 
 test("per-entry preview override is independent of the global default", () => {
+	const path = writeCard(PNG, "one-off.png");
 	const cards = createImageCardRenderer(() => false);
 	const data: ImageCardData = {
-		id: "one-off", path: "/tmp/one-off.png", provider: "xai", model: "grok",
-		showInConversation: true, preview: { data: PNG.toString("base64"), mimeType: "image/png" },
+		id: "one-off", path, provider: "xai", model: "grok", showInConversation: true,
 	};
 	cards.markLive(data);
 	assert.doesNotMatch(cards.render(data, false, theme() as never).render(80).join("\n"), /Ctrl\+O to expand image/);
 });
 
-test("oversized stored preview falls back to a file link", () => {
+test("expanded original image is not height-capped to a thumbnail", () => {
+	const path = writeCard(PNG, "original.png");
 	const cards = createImageCardRenderer(() => true);
-	const data: ImageCardData = {
-		id: "huge", path: "/tmp/huge.png", provider: "xai", model: "grok",
-		showInConversation: true, preview: { data: "A".repeat(200 * 1024), mimeType: "image/png" },
-	};
+	const data: ImageCardData = { id: "orig", path, provider: "xai", model: "grok", showInConversation: true };
 	cards.markLive(data);
-	assert.match(cards.render(data, false, theme() as never).render(80).join("\n"), /Preview unavailable/);
+	resetCapabilitiesCache();
+	setCapabilityOverrides({ images: "iterm2" });
+	try {
+		const lines = cards.render(data, false, theme() as never).render(80);
+		assert.ok(lines.some((line) => line.includes("1337;File=") || line.includes(path)));
+		assert.doesNotMatch(lines.join("\n"), /Ctrl\+O to expand image/);
+	} finally {
+		resetCapabilitiesCache();
+	}
 });
 
 test("legacy JPEG files are not rewritten", () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-access-"));
-	const path = join(dir, "legacy.png");
-	writeFileSync(path, JPEG);
+	const path = writeCard(JPEG, "legacy.png");
 	const cards = createImageCardRenderer(() => true);
 	const data: ImageCardData = { path, provider: "xai", model: "grok" };
 	cards.markLive(data);

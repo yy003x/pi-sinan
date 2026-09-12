@@ -1,13 +1,12 @@
 import { readFileSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { convertToPng, resizeImage, type Theme } from "@earendil-works/pi-coding-agent";
+import { convertToPng, type Theme } from "@earendil-works/pi-coding-agent";
 import { Box, Image, Text, getCapabilities, getImageDimensions, hyperlink } from "@earendil-works/pi-tui";
 
-const MAX_PREVIEW_BYTES = 192 * 1024; // Base64 bytes, not the original file size.
-const MAX_LEGACY_BYTES = 4 * 1024 * 1024;
-const MAX_CACHE_BYTES = 8 * 1024 * 1024;
+const MAX_ORIGINAL_BYTES = 8 * 1024 * 1024;
+const MAX_CACHE_BYTES = 16 * 1024 * 1024;
 
-export interface PreviewImage {
+export interface OriginalImage {
 	data: string;
 	mimeType: string;
 }
@@ -21,7 +20,6 @@ export interface ImageCardData {
 	width?: number;
 	height?: number;
 	showInConversation?: boolean;
-	preview?: PreviewImage;
 }
 
 /** Inspect bytes, never the requested filename or a provider's claimed MIME. */
@@ -34,7 +32,7 @@ export function imageMimeType(bytes: Uint8Array): string {
 	throw new Error("Image response is not a supported PNG, JPEG, GIF or WebP file");
 }
 
-function dimensions(image: PreviewImage) {
+function dimensions(image: OriginalImage) {
 	const size = getImageDimensions(image.data, image.mimeType);
 	if (!size || size.widthPx <= 0 || size.heightPx <= 0) throw new Error("Cannot determine image dimensions");
 	return size;
@@ -54,53 +52,33 @@ export async function normalizePng(bytes: Uint8Array): Promise<Buffer> {
 	return Buffer.from(converted.data, "base64");
 }
 
-/** A preview failure must not turn a successfully saved original into a generation failure. */
-export async function createPreview(bytes: Uint8Array): Promise<PreviewImage | undefined> {
-	try {
-		const mimeType = imageMimeType(bytes);
-		for (const scale of [1, 0.5]) {
-			const resized = await resizeImage(bytes, mimeType, {
-				maxWidth: 480 * scale, maxHeight: 240 * scale, maxBytes: MAX_PREVIEW_BYTES,
-			});
-			if (!resized) return undefined;
-			const png = await convertToPng(resized.data, resized.mimeType);
-			if (!png) return undefined;
-			const size = dimensions(png);
-			if (png.data.length <= MAX_PREVIEW_BYTES && size.widthPx <= 480 && size.heightPx <= 240) return png;
-		}
-	} catch {
-		// Keep the saved file and render its link instead.
-	}
-	return undefined;
-}
-
 /** Shared by command entries and tool results. No image content is injected into model context. */
 export function createImageCardRenderer(defaultPreview: () => boolean) {
 	const live = new Set<string>();
 	const expansion = new Map<string, boolean>();
-	const legacyCache = new Map<string, { version: string; image: PreviewImage }>();
+	const fileCache = new Map<string, { version: string; image: OriginalImage }>();
 	let cacheBytes = 0;
 
-	function legacyPreview(path: string): PreviewImage | undefined {
+	function originalImage(path: string): OriginalImage {
 		const stat = statSync(path);
-		if (!stat.isFile() || stat.size > MAX_LEGACY_BYTES) return undefined;
+		if (!stat.isFile() || stat.size > MAX_ORIGINAL_BYTES) throw new Error("Original image unavailable");
 		const version = `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
-		const cached = legacyCache.get(path);
+		const cached = fileCache.get(path);
 		if (cached?.version === version) return cached.image;
 		if (cached) {
 			cacheBytes -= cached.image.data.length;
-			legacyCache.delete(path);
+			fileCache.delete(path);
 		}
 		const bytes = readFileSync(path);
 		const image = { data: bytes.toString("base64"), mimeType: imageMimeType(bytes) };
 		dimensions(image);
-		while (legacyCache.size >= 8 || cacheBytes + image.data.length > MAX_CACHE_BYTES) {
-			const oldest = legacyCache.keys().next().value;
+		while (fileCache.size >= 8 || cacheBytes + image.data.length > MAX_CACHE_BYTES) {
+			const oldest = fileCache.keys().next().value;
 			if (oldest === undefined) break;
-			cacheBytes -= legacyCache.get(oldest)!.image.data.length;
-			legacyCache.delete(oldest);
+			cacheBytes -= fileCache.get(oldest)!.image.data.length;
+			fileCache.delete(oldest);
 		}
-		legacyCache.set(path, { version, image });
+		fileCache.set(path, { version, image });
 		cacheBytes += image.data.length;
 		return image;
 	}
@@ -110,7 +88,7 @@ export function createImageCardRenderer(defaultPreview: () => boolean) {
 		reset() {
 			live.clear();
 			expansion.clear();
-			legacyCache.clear();
+			fileCache.clear();
 			cacheBytes = 0;
 		},
 		render(data: ImageCardData, expanded: boolean, theme: Theme, showImages = true) {
@@ -118,8 +96,8 @@ export function createImageCardRenderer(defaultPreview: () => boolean) {
 			if (expansion.get(key) === true && !expanded) live.delete(key);
 			expansion.set(key, expanded);
 			const box = new Box(0, 0);
-			const size = data.width && data.height ? ` · ${data.width}×${data.height}` : "";
-			box.addChild(new Text(`${theme.fg("accent", "[image]")} ${data.provider}/${data.model}${size}`, 0, 0));
+			const sizeLabel = data.width && data.height ? ` · ${data.width}×${data.height}` : "";
+			box.addChild(new Text(`${theme.fg("accent", "[image]")} ${data.provider}/${data.model}${sizeLabel}`, 0, 0));
 			box.addChild(new Text(hyperlink(data.path, pathToFileURL(data.path).href), 0, 0));
 			const enabled = data.showInConversation ?? defaultPreview();
 			if (!enabled || !showImages) return box;
@@ -128,19 +106,17 @@ export function createImageCardRenderer(defaultPreview: () => boolean) {
 				return box;
 			}
 			try {
-				// Only legacy entries lack a recorded preview decision/thumbnail. Never rewrite their files.
-				const image = data.preview ?? (data.showInConversation === undefined ? legacyPreview(data.path) : undefined);
-				if (!image) throw new Error("Preview unavailable");
-				if (data.preview && image.data.length > MAX_PREVIEW_BYTES) throw new Error("Preview exceeds size limit");
+				const image = originalImage(data.path);
 				const actualMime = imageMimeType(Buffer.from(image.data, "base64"));
 				const size = dimensions({ ...image, mimeType: actualMime });
-				if (data.preview && (size.widthPx > 480 || size.heightPx > 240)) throw new Error("Preview exceeds dimensions limit");
-				if (getCapabilities().images === "kitty" && actualMime !== "image/png") throw new Error("PNG preview required");
+				if (getCapabilities().images === "kitty" && actualMime !== "image/png") throw new Error("PNG required");
 				box.addChild(new Image(image.data, actualMime, { fallbackColor: (s) => theme.fg("dim", s) }, {
-					maxWidthCells: 48, maxHeightCells: 12, filename: data.path,
+					maxWidthCells: 1000,
+					maxHeightCells: 1000,
+					filename: data.path,
 				}, size));
 			} catch {
-				box.addChild(new Text(theme.fg("dim", "Preview unavailable; open the original file above."), 0, 0));
+				box.addChild(new Text(theme.fg("dim", "Image unavailable; open the original file above."), 0, 0));
 			}
 			return box;
 		},

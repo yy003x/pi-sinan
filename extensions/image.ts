@@ -17,7 +17,7 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text, getImageDimensions } from "@earendil-works/pi-tui";
-import { createImageCardRenderer, createPreview, normalizePng, type ImageCardData } from "../src/image-preview.ts";
+import { createImageCardRenderer, normalizePng, type ImageCardData } from "../src/image-preview.ts";
 
 const XAI_DEFAULT_MODEL = "grok-imagine-image-2.0";
 const XAI_MODELS = new Set([
@@ -290,7 +290,6 @@ async function cardData(result: GeneratedImage, preview: boolean): Promise<Image
 		id: randomUUID(), path: result.path, provider: result.provider, model: result.model,
 		bytes: result.bytes, width: size.widthPx, height: size.heightPx,
 		showInConversation: preview,
-		...(preview ? { preview: await createPreview(Buffer.from(result.dataBase64, "base64")) } : {}),
 	};
 }
 
@@ -310,7 +309,7 @@ export default function (pi: ExtensionAPI) {
 		"generate_image uses existing Pi login: xAI subscription/API key, or OpenAI API key. Do not ask for a new key if those are configured.",
 		"OpenAI Codex/ChatGPT OAuth cannot generate images. Do not switch to gpt-6-astra hoping it will emit a PNG.",
 		"After generate_image succeeds, report the saved path and which provider produced it.",
-		"generate_image shows a thumbnail card when piAccess.image.showInConversation is true; do not set show_in_conversation unless the user asked to override that setting.",
+		"generate_image shows the original image in the conversation when piAccess.image.showInConversation is true; do not set show_in_conversation unless the user asked to override that setting.",
 		"generate_image returns file metadata, not image content to the model. Read the saved image only when visual inspection is needed.",
 	],
 	parameters: Type.Object({
