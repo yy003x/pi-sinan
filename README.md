@@ -20,7 +20,8 @@ Then `/reload`.
 
 ```text
 extensions/
-  image.ts    # generate images with xAI subscription or OpenAI API key
+  image.ts                    # generate images with xAI subscription or OpenAI API key
+  openai-codex-recovery.ts    # adaptive WebSocket/SSE recovery for OpenAI Codex
 ```
 
 Add another capability by adding another `extensions/<name>.ts` that `export default function (pi)`. Pi loads every `.ts` / `.js` file in this directory. Keep tests outside `extensions/` so they are not loaded as extensions.
@@ -39,6 +40,21 @@ Disable one resource without removing the package:
 ```
 
 ## Extensions
+
+### openai-codex-recovery
+
+Requires Pi 0.85.1 or newer. Wraps the current effective `openai-codex` provider without replacing its OAuth flow or model catalog.
+When `transport` is `"auto"`, it:
+
+- prefers Pi's normal cached WebSocket path;
+- uses SSE during a two-minute cooldown after a WebSocket transport failure;
+- probes WebSocket again after three successful SSE requests or when the cooldown expires;
+- allows only one concurrent recovery probe per session;
+- includes nested network error codes such as `ECONNRESET` in SSE `fetch failed` errors and diagnostics.
+
+Explicit `"sse"`, `"websocket"`, and `"websocket-cached"` settings are passed through without adaptive selection. Use `/codex-recovery` to inspect the current session state, or `/codex-recovery reset` to clear it and prefer WebSocket again.
+
+This extension changes only `openai-codex` transport selection. It does not read or store OAuth tokens, request bodies, or authentication headers.
 
 ### image
 
