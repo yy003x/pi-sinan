@@ -111,8 +111,6 @@ test("wraps class-based effective providers without losing auth or dynamic model
 	const base = new ClassProvider() as unknown as Provider<"openai-codex-responses">;
 	const recovery = createCodexRecoveryController({}, {
 		baseProvider: base,
-		getWebSocketStats: () => undefined,
-		resetWebSocketState: () => {},
 	});
 
 	assert.equal(recovery.provider.id, "openai-codex");
@@ -144,8 +142,6 @@ test("capacity overload delays the next Pi-owned retry without replaying the fai
 				waits.push(ms);
 				now += ms;
 			},
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "capacity-session" };
@@ -174,8 +170,6 @@ test("capacity cooldown honors Retry-After and reset clears it", async () => {
 			baseProvider: base,
 			now: () => 1_000,
 			random: () => 0.5,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 
@@ -210,8 +204,6 @@ test("a waiting retry rereads a cooldown extended by another in-flight failure",
 					},
 				});
 			}),
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "capacity-concurrent" };
@@ -256,8 +248,6 @@ test("reset aborts a scheduled capacity wait before another provider request sta
 		{
 			baseProvider: base,
 			random: () => 0.5,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "capacity-reset" };
@@ -283,8 +273,6 @@ test("capacity cooldown is abortable before another provider request starts", as
 			baseProvider: base,
 			random: () => 0.5,
 			sleep: async (_ms, signal) => signal?.throwIfAborted(),
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "capacity-abort" };
@@ -302,8 +290,6 @@ test("terminal subscription limits do not arm capacity cooldown", async () => {
 	const base = fakeProvider(() => terminalStream(assistant("error", "Monthly usage limit reached")));
 	const recovery = createCodexRecoveryController({}, {
 		baseProvider: base,
-		getWebSocketStats: () => undefined,
-		resetWebSocketState: () => {},
 	});
 
 	await complete(recovery.provider, { transport: "auto", sessionId: "usage-limit" });
@@ -313,7 +299,6 @@ test("terminal subscription limits do not arm capacity cooldown", async () => {
 test("auto mode cools down on websocket failure, uses SSE, then probes websocket", async () => {
 	let now = 1_000;
 	const transports: Array<StreamOptions["transport"]> = [];
-	const resets: Array<string | undefined> = [];
 	const responses = [
 		assistant("error", "WebSocket error", [websocketFailure()]),
 		assistant("stop"),
@@ -330,8 +315,6 @@ test("auto mode cools down on websocket failure, uses SSE, then probes websocket
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: (sessionId?: string) => { if (sessionId) resets.push(sessionId); },
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-1" };
@@ -344,8 +327,7 @@ test("auto mode cools down on websocket failure, uses SSE, then probes websocket
 	assert.equal(recovery.getStatus("session-1").consecutiveSseSuccesses, 3);
 	await complete(recovery.provider, options);
 
-	assert.deepEqual(transports, ["auto", "sse", "sse", "sse", "websocket-cached"]);
-	assert.deepEqual(resets, ["session-1"]);
+	assert.deepEqual(transports, ["auto", "sse", "sse", "sse", "websocket"]);
 	assert.equal(recovery.getStatus("session-1").mode, "websocket-preferred");
 	now += 1;
 });
@@ -373,8 +355,6 @@ test("cooldown expiry allows one websocket probe while concurrent calls stay on 
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-2" };
@@ -388,7 +368,7 @@ test("cooldown expiry allows one websocket probe while concurrent calls stay on 
 	finishProbe?.();
 	await probe;
 
-	assert.deepEqual(transports, ["auto", "websocket-cached", "sse", "sse"]);
+	assert.deepEqual(transports, ["auto", "websocket", "sse", "sse"]);
 	assert.equal(recovery.getStatus("session-2").mode, "websocket-preferred");
 });
 
@@ -409,8 +389,6 @@ test("an aborted websocket probe releases the single-probe guard", async () => {
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-abort" };
@@ -421,7 +399,7 @@ test("an aborted websocket probe releases the single-probe guard", async () => {
 	assert.equal(recovery.getStatus("session-abort").mode, "sse-cooldown");
 	await complete(recovery.provider, options);
 
-	assert.deepEqual(transports, ["auto", "websocket-cached", "websocket-cached"]);
+	assert.deepEqual(transports, ["auto", "websocket", "websocket"]);
 	assert.equal(recovery.getStatus("session-abort").mode, "websocket-preferred");
 });
 
@@ -441,8 +419,6 @@ test("a non-transport probe error restores websocket preference instead of exten
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-api-error" };
@@ -451,7 +427,7 @@ test("a non-transport probe error restores websocket preference instead of exten
 	now += 100;
 	await complete(recovery.provider, options);
 
-	assert.deepEqual(transports, ["auto", "websocket-cached"]);
+	assert.deepEqual(transports, ["auto", "websocket"]);
 	assert.equal(recovery.getStatus("session-api-error").mode, "websocket-preferred");
 });
 
@@ -469,8 +445,6 @@ test("a synchronous provider throw releases a websocket probe", async () => {
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-sync-throw" };
@@ -482,7 +456,7 @@ test("a synchronous provider throw releases a websocket probe", async () => {
 	assert.equal(recovery.getStatus("session-sync-throw").mode, "websocket-preferred");
 	await complete(recovery.provider, options);
 
-	assert.deepEqual(transports, ["auto", "websocket-cached", "auto"]);
+	assert.deepEqual(transports, ["auto", "websocket", "auto"]);
 });
 
 test("a non-transport stream iteration throw does not force SSE fallback", async () => {
@@ -501,8 +475,6 @@ test("a non-transport stream iteration throw does not force SSE fallback", async
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-stream-throw" };
@@ -534,8 +506,6 @@ test("reset invalidates completion from an older in-flight probe", async () => {
 		{
 			baseProvider: base,
 			now: () => now,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-reset" };
@@ -547,7 +517,7 @@ test("reset invalidates completion from an older in-flight probe", async () => {
 	finishProbe?.();
 	await probe;
 
-	assert.equal(recovery.getStatus("session-reset").mode, "websocket-preferred");
+	assert.equal(recovery.getStatus("session-reset").mode, "websocket-probe");
 });
 
 test("SSE fetch failures expose errno codes without persisting nested sensitive messages", async () => {
@@ -578,8 +548,6 @@ test("SSE fetch failures expose errno codes without persisting nested sensitive 
 		{},
 		{
 			baseProvider: base,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: () => {},
 		},
 	);
 	const result = await complete(recovery.provider, {
@@ -604,7 +572,6 @@ test("SSE fetch failures expose errno codes without persisting nested sensitive 
 
 test("explicit transport bypasses adaptive decisions and reset clears cooldown", async () => {
 	const transports: Array<StreamOptions["transport"]> = [];
-	const resets: Array<string | undefined> = [];
 	const base = fakeProvider((options, call) => {
 		transports.push(options?.transport);
 		return terminalStream(
@@ -615,8 +582,6 @@ test("explicit transport bypasses adaptive decisions and reset clears cooldown",
 		{},
 		{
 			baseProvider: base,
-			getWebSocketStats: () => undefined,
-			resetWebSocketState: (sessionId?: string) => { if (sessionId) resets.push(sessionId); },
 		},
 	);
 
@@ -627,7 +592,6 @@ test("explicit transport bypasses adaptive decisions and reset clears cooldown",
 	recovery.reset("session-4");
 	await complete(recovery.provider, { transport: "auto", sessionId: "session-4" });
 
-	assert.deepEqual(transports, ["auto", "sse", "websocket", "websocket-cached", "auto"]);
-	assert.deepEqual(resets, ["session-4", "session-4", "session-4"]);
+	assert.deepEqual(transports, ["auto", "sse", "websocket", "websocket-cached", "websocket"]);
 	assert.equal(recovery.getStatus("session-4").mode, "websocket-preferred");
 });

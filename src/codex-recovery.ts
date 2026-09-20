@@ -11,10 +11,6 @@ import {
 	type StreamOptions,
 	type Transport,
 } from "@earendil-works/pi-ai";
-import {
-	getOpenAICodexWebSocketDebugStats,
-	resetOpenAICodexWebSocketDebugStats,
-} from "@earendil-works/pi-ai/api/openai-codex-responses";
 
 const DEFAULT_COOLDOWN_MS = 2 * 60 * 1000;
 const DEFAULT_SSE_SUCCESSES_BEFORE_PROBE = 3;
@@ -80,6 +76,7 @@ type RequestDecision = {
 	generation?: number;
 	adaptive: boolean;
 	probe: boolean;
+	forcedProbe?: boolean;
 };
 
 export type CodexRecoveryStatus = {
@@ -107,8 +104,6 @@ export interface CodexRecoveryDependencies {
 	now?: () => number;
 	random?: () => number;
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-	getWebSocketStats?: typeof getOpenAICodexWebSocketDebugStats;
-	resetWebSocketState?: typeof resetOpenAICodexWebSocketDebugStats;
 }
 
 export interface CodexRecoveryController {
@@ -317,17 +312,17 @@ export function createCodexRecoveryController(
 	const now = dependencies.now ?? Date.now;
 	const random = dependencies.random ?? Math.random;
 	const sleep = dependencies.sleep ?? defaultSleep;
-	const getWebSocketStats = dependencies.getWebSocketStats ?? getOpenAICodexWebSocketDebugStats;
-	const resetWebSocketState = dependencies.resetWebSocketState ?? resetOpenAICodexWebSocketDebugStats;
 	const states = new Map<string, RecoveryState>();
 	const capacityStates = new Map<string, CapacityState>();
 	const capacityWaiters = new Map<string, Set<AbortController>>();
+	const forcedProbeSessions = new Set<string>();
 	const generations = new Map<string, number>();
 	const activeSessions = new Set<string>();
 	const generationOf = (sessionId: string) => generations.get(sessionId) ?? 0;
 	const advanceGeneration = (sessionId: string) => generations.set(sessionId, generationOf(sessionId) + 1);
 
 	const enterCooldown = (sessionId: string, reason?: string) => {
+		forcedProbeSessions.delete(sessionId);
 		const previous = states.get(sessionId);
 		states.set(sessionId, {
 			fallbackUntil: now() + cooldownMs,
@@ -396,8 +391,8 @@ export function createCodexRecoveryController(
 		if (sessionId) activeSessions.add(sessionId);
 		if (sessionId && (configuredTransport === "websocket" || configuredTransport === "websocket-cached")) {
 			states.delete(sessionId);
+			forcedProbeSessions.delete(sessionId);
 			advanceGeneration(sessionId);
-			resetWebSocketState(sessionId);
 		}
 		const generation = sessionId ? generationOf(sessionId) : undefined;
 		if (configuredTransport !== "auto" || !sessionId) {
@@ -411,11 +406,19 @@ export function createCodexRecoveryController(
 			};
 		}
 
-		let state = states.get(sessionId);
-		if (!state && getWebSocketStats(sessionId)?.websocketFallbackActive) {
-			enterCooldown(sessionId, "Existing Pi WebSocket fallback state detected");
-			state = states.get(sessionId);
+		if (forcedProbeSessions.has(sessionId)) {
+			return {
+				configuredTransport,
+				effectiveTransport: "websocket",
+				sessionId,
+				generation,
+				adaptive: true,
+				probe: true,
+				forcedProbe: true,
+			};
 		}
+
+		const state = states.get(sessionId);
 		if (!state) {
 			return {
 				configuredTransport,
@@ -430,10 +433,9 @@ export function createCodexRecoveryController(
 		const probeReady = now() >= state.fallbackUntil || state.consecutiveSseSuccesses >= sseSuccessesBeforeProbe;
 		if (probeReady && !state.probeInFlight) {
 			state.probeInFlight = true;
-			resetWebSocketState(sessionId);
 			return {
 				configuredTransport,
-				effectiveTransport: "websocket-cached",
+				effectiveTransport: "websocket",
 				sessionId,
 				generation,
 				adaptive: true,
@@ -471,7 +473,7 @@ export function createCodexRecoveryController(
 		const sessionId = decision.sessionId;
 		if (decision.generation !== generationOf(sessionId)) return;
 		if (message.stopReason === "aborted") {
-			if (decision.probe) {
+			if (decision.probe && !decision.forcedProbe) {
 				const state = states.get(sessionId);
 				if (state) state.probeInFlight = false;
 			}
@@ -495,6 +497,7 @@ export function createCodexRecoveryController(
 			// API/auth/rate-limit failures must not force SSE because changing transport
 			// cannot fix them.
 			states.delete(sessionId);
+			forcedProbeSessions.delete(sessionId);
 		}
 	};
 
@@ -606,7 +609,7 @@ export function createCodexRecoveryController(
 			};
 			if (!state) {
 				return {
-					mode: "websocket-preferred",
+					mode: forcedProbeSessions.has(sessionId) ? "websocket-probe" : "websocket-preferred",
 					consecutiveSseSuccesses: 0,
 					websocketFailures: 0,
 					...capacityStatus,
@@ -628,16 +631,16 @@ export function createCodexRecoveryController(
 				states.delete(sessionId);
 				capacityStates.delete(sessionId);
 				cancelCapacityWaiters(sessionId);
-				resetWebSocketState(sessionId);
+				forcedProbeSessions.add(sessionId);
 				return;
 			}
 			for (const activeSessionId of activeSessions) {
 				advanceGeneration(activeSessionId);
 				cancelCapacityWaiters(activeSessionId);
+				forcedProbeSessions.add(activeSessionId);
 			}
 			states.clear();
 			capacityStates.clear();
-			resetWebSocketState();
 		},
 	};
 }

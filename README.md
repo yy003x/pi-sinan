@@ -111,12 +111,13 @@ usage package.
 - Command: `/codex-recovery`
 - Command: `/codex-recovery reset`
 
-For OpenAI Codex only, automatic transport mode prefers Pi's cached WebSocket,
-uses SSE during a two-minute cooldown after a transport failure, and probes
-WebSocket again after successful SSE requests or cooldown expiry. Capacity
-errors add bounded, abortable delay before Pi's next retry. Explicit transport
-settings pass through unchanged. The reset command clears only in-memory
-transport/capacity recovery state; it does not modify subscription quota.
+For OpenAI Codex only, automatic transport mode prefers Pi's normal WebSocket
+path, uses SSE during a two-minute cooldown after a transport failure, and
+probes WebSocket directly after successful SSE requests or cooldown expiry.
+Capacity errors add bounded, abortable delay before Pi's next retry. Explicit
+transport settings pass through unchanged. The reset command clears only
+in-memory transport/capacity recovery state and forces the next automatic call
+to probe WebSocket directly; it does not modify subscription quota.
 
 ## Configuration
 
