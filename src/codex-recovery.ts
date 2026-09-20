@@ -18,8 +18,13 @@ import {
 
 const DEFAULT_COOLDOWN_MS = 2 * 60 * 1000;
 const DEFAULT_SSE_SUCCESSES_BEFORE_PROBE = 3;
+const DEFAULT_CAPACITY_BASE_DELAY_MS = 4_000;
+const DEFAULT_CAPACITY_MAX_DELAY_MS = 30_000;
 const MAX_CAUSE_DEPTH = 6;
-const RECOVERY_PROVIDER_MARKER = Symbol.for("pi-access.openai-codex-recovery");
+const CAPACITY_ERROR_PATTERN = /overloaded|currently experiencing high demand|service unavailable|\b(?:429|502|503|504)\b/i;
+const TERMINAL_LIMIT_ERROR_PATTERN = /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/i;
+const CAPACITY_FAILURE_MESSAGE = "OpenAI Codex capacity is temporarily overloaded";
+const RECOVERY_PROVIDER_MARKER = Symbol.for("pi-sinan.codex-recovery");
 const NETWORK_ERROR_CODES = new Set([
 	"CERT_HAS_EXPIRED",
 	"DEPTH_ZERO_SELF_SIGNED_CERT",
@@ -61,6 +66,13 @@ type RecoveryState = {
 	lastFailureAt?: number;
 };
 
+type CapacityState = {
+	cooldownUntil: number;
+	failures: number;
+	lastFailure: string;
+	lastFailureAt: number;
+};
+
 type RequestDecision = {
 	configuredTransport: Transport;
 	effectiveTransport: Transport;
@@ -77,16 +89,24 @@ export type CodexRecoveryStatus = {
 	websocketFailures: number;
 	lastFailure?: string;
 	lastFailureAt?: number;
+	capacityCooldownUntil?: number;
+	capacityFailures: number;
+	lastCapacityFailure?: string;
+	lastCapacityFailureAt?: number;
 };
 
 export interface CodexRecoveryPolicy {
 	cooldownMs?: number;
 	sseSuccessesBeforeProbe?: number;
+	capacityBaseDelayMs?: number;
+	capacityMaxDelayMs?: number;
 }
 
 export interface CodexRecoveryDependencies {
 	baseProvider?: CodexProvider;
 	now?: () => number;
+	random?: () => number;
+	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	getWebSocketStats?: typeof getOpenAICodexWebSocketDebugStats;
 	resetWebSocketState?: typeof resetOpenAICodexWebSocketDebugStats;
 }
@@ -122,6 +142,49 @@ function transportDiagnostic(message: AssistantMessage): AssistantMessageDiagnos
 
 function failureText(diagnostic: AssistantMessageDiagnostic | undefined, fallback?: string): string | undefined {
 	return diagnostic?.error?.message || fallback;
+}
+
+function capacityFailure(message: AssistantMessage): string | undefined {
+	const errorMessage = message.stopReason === "error" ? message.errorMessage : undefined;
+	if (!errorMessage || TERMINAL_LIMIT_ERROR_PATTERN.test(errorMessage) || !CAPACITY_ERROR_PATTERN.test(errorMessage)) {
+		return undefined;
+	}
+	return CAPACITY_FAILURE_MESSAGE;
+}
+
+function retryAfterMs(headers: Record<string, string | undefined>, now: number): number | undefined {
+	const milliseconds = Number(headers["retry-after-ms"]);
+	if (Number.isFinite(milliseconds) && milliseconds >= 0) return milliseconds;
+	const retryAfter = headers["retry-after"];
+	if (!retryAfter) return undefined;
+	const seconds = Number(retryAfter);
+	if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+	const date = Date.parse(retryAfter);
+	return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+}
+
+function abortError(): Error {
+	const error = new Error("Request was aborted");
+	error.name = "AbortError";
+	return error;
+}
+
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(abortError());
+			return;
+		}
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(abortError());
+		};
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 function errorCode(value: unknown): string | undefined {
@@ -199,11 +262,17 @@ function appendFetchDiagnostic(
 	message.diagnostics = [...(message.diagnostics ?? []), diagnostic];
 }
 
-function unexpectedFailure(model: { api: string; provider: string; id: string }, error: unknown): AssistantMessage {
+function unexpectedFailure(
+	model: { api: string; provider: string; id: string },
+	error: unknown,
+	aborted = false,
+): AssistantMessage {
 	const failure = collectNetworkFailure(error);
-	const errorMessage = failure.codes.length > 0
-		? `provider stream failed (${failure.codes.join(", ")})`
-		: "provider stream failed";
+	const errorMessage = aborted
+		? "Request was aborted"
+		: failure.codes.length > 0
+			? `provider stream failed (${failure.codes.join(", ")})`
+			: "provider stream failed";
 	return {
 		role: "assistant",
 		content: [],
@@ -218,7 +287,7 @@ function unexpectedFailure(model: { api: string; provider: string; id: string },
 			totalTokens: 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
-		stopReason: "error",
+		stopReason: aborted ? "aborted" : "error",
 		errorMessage,
 		timestamp: Date.now(),
 	};
@@ -230,17 +299,29 @@ export function createCodexRecoveryController(
 ): CodexRecoveryController {
 	const cooldownMs = policy.cooldownMs ?? DEFAULT_COOLDOWN_MS;
 	const sseSuccessesBeforeProbe = policy.sseSuccessesBeforeProbe ?? DEFAULT_SSE_SUCCESSES_BEFORE_PROBE;
+	const capacityBaseDelayMs = policy.capacityBaseDelayMs ?? DEFAULT_CAPACITY_BASE_DELAY_MS;
+	const capacityMaxDelayMs = policy.capacityMaxDelayMs ?? DEFAULT_CAPACITY_MAX_DELAY_MS;
 	if (!Number.isFinite(cooldownMs) || cooldownMs < 0) throw new Error("cooldownMs must be a non-negative number");
 	if (!Number.isInteger(sseSuccessesBeforeProbe) || sseSuccessesBeforeProbe < 1) {
 		throw new Error("sseSuccessesBeforeProbe must be a positive integer");
+	}
+	if (!Number.isFinite(capacityBaseDelayMs) || capacityBaseDelayMs < 0) {
+		throw new Error("capacityBaseDelayMs must be a non-negative number");
+	}
+	if (!Number.isFinite(capacityMaxDelayMs) || capacityMaxDelayMs < 0) {
+		throw new Error("capacityMaxDelayMs must be a non-negative number");
 	}
 
 	if (!dependencies.baseProvider) throw new Error("baseProvider is required");
 	const base = unwrapCodexRecoveryProvider(dependencies.baseProvider);
 	const now = dependencies.now ?? Date.now;
+	const random = dependencies.random ?? Math.random;
+	const sleep = dependencies.sleep ?? defaultSleep;
 	const getWebSocketStats = dependencies.getWebSocketStats ?? getOpenAICodexWebSocketDebugStats;
 	const resetWebSocketState = dependencies.resetWebSocketState ?? resetOpenAICodexWebSocketDebugStats;
 	const states = new Map<string, RecoveryState>();
+	const capacityStates = new Map<string, CapacityState>();
+	const capacityWaiters = new Map<string, Set<AbortController>>();
 	const generations = new Map<string, number>();
 	const activeSessions = new Set<string>();
 	const generationOf = (sessionId: string) => generations.get(sessionId) ?? 0;
@@ -255,6 +336,58 @@ export function createCodexRecoveryController(
 			websocketFailures: (previous?.websocketFailures ?? 0) + 1,
 			...(reason ? { lastFailure: reason, lastFailureAt: now() } : {}),
 		});
+	};
+
+	// Pi owns the retry count and replays the assistant call. This layer only
+	// delays the next request so concurrent sessions do not retry in lockstep.
+	const enterCapacityCooldown = (sessionId: string, reason: string, requestedDelayMs?: number) => {
+		const previous = capacityStates.get(sessionId);
+		const failures = (previous?.failures ?? 0) + 1;
+		const exponentialDelay = capacityBaseDelayMs * 2 ** Math.min(failures - 1, 20);
+		const jitter = 0.5 + Math.min(1, Math.max(0, random()));
+		const localDelay = Math.round(exponentialDelay * jitter);
+		const delayMs = Math.min(capacityMaxDelayMs, Math.max(localDelay, requestedDelayMs ?? 0));
+		capacityStates.set(sessionId, {
+			cooldownUntil: now() + delayMs,
+			failures,
+			lastFailure: reason,
+			lastFailureAt: now(),
+		});
+	};
+
+	const waitForCapacity = (sessionId: string | undefined, signal?: AbortSignal): Promise<void> | undefined => {
+		if (!sessionId || !capacityStates.has(sessionId)) return undefined;
+		return (async () => {
+			const controller = new AbortController();
+			const onCallerAbort = () => controller.abort();
+			if (signal?.aborted) controller.abort();
+			else signal?.addEventListener("abort", onCallerAbort, { once: true });
+			const waiters = capacityWaiters.get(sessionId) ?? new Set<AbortController>();
+			waiters.add(controller);
+			capacityWaiters.set(sessionId, waiters);
+			try {
+				for (;;) {
+					const state = capacityStates.get(sessionId);
+					if (!state) return;
+					const delayMs = Math.max(0, state.cooldownUntil - now());
+					if (delayMs <= 0) return;
+					await sleep(delayMs, controller.signal);
+				}
+			} finally {
+				signal?.removeEventListener("abort", onCallerAbort);
+				waiters.delete(controller);
+				if (waiters.size === 0 && capacityWaiters.get(sessionId) === waiters) {
+					capacityWaiters.delete(sessionId);
+				}
+			}
+		})();
+	};
+
+	const cancelCapacityWaiters = (sessionId: string) => {
+		const waiters = capacityWaiters.get(sessionId);
+		if (!waiters) return;
+		capacityWaiters.delete(sessionId);
+		for (const controller of waiters) controller.abort();
 	};
 
 	const decide = (options: CodexOptions | undefined): RequestDecision => {
@@ -318,6 +451,21 @@ export function createCodexRecoveryController(
 		};
 	};
 
+	const finalizeCapacity = (
+		message: AssistantMessage,
+		decision: RequestDecision,
+		requestedDelayMs?: number,
+	) => {
+		if (!decision.sessionId || decision.generation !== generationOf(decision.sessionId)) return;
+		if (message.stopReason === "aborted") return;
+		const failure = capacityFailure(message);
+		if (failure) {
+			enterCapacityCooldown(decision.sessionId, failure, requestedDelayMs);
+			return;
+		}
+		capacityStates.delete(decision.sessionId);
+	};
+
 	const finalize = (message: AssistantMessage, decision: RequestDecision) => {
 		if (!decision.adaptive || !decision.sessionId) return;
 		const sessionId = decision.sessionId;
@@ -354,16 +502,22 @@ export function createCodexRecoveryController(
 		model: { api: string; provider: string; id: string },
 		decision: RequestDecision,
 		fetchFailure: () => NetworkFailure | undefined,
-		source: AssistantMessageEventStream,
+		capacityRetryAfter: () => number | undefined,
+		openSource: () => AssistantMessageEventStream,
+		signal?: AbortSignal,
 	): AssistantMessageEventStream => {
 		const target = createAssistantMessageEventStream();
 		void (async () => {
 			try {
+				const capacityWait = waitForCapacity(decision.sessionId, signal);
+				if (capacityWait) await capacityWait;
+				const source = openSource();
 				for await (const event of source) {
 					if (isTerminalEvent(event)) {
 						const message = terminalMessage(event);
 						const failure = fetchFailure();
 						if (failure) appendFetchDiagnostic(message, failure, decision);
+						finalizeCapacity(message, decision, capacityRetryAfter());
 						finalize(message, decision);
 					}
 					target.push(event);
@@ -372,9 +526,11 @@ export function createCodexRecoveryController(
 				// Pi providers should encode failures as terminal stream events. If a
 				// custom/effective provider violates that contract, surface a generic
 				// error but do not assume changing transport can fix it.
-				const message = unexpectedFailure(model, error);
+				const aborted = signal?.aborted === true || (error instanceof Error && error.name === "AbortError");
+				const message = unexpectedFailure(model, error, aborted);
+				finalizeCapacity(message, decision, capacityRetryAfter());
 				finalize(message, decision);
-				target.push({ type: "error", reason: "error", error: message });
+				target.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
 			} finally {
 				target.end();
 			}
@@ -389,26 +545,28 @@ export function createCodexRecoveryController(
 	): AssistantMessageEventStream => {
 		const decision = decide(options);
 		let lastFetchFailure: NetworkFailure | undefined;
+		let serverRetryAfterMs: number | undefined;
 		const baseFetch = options?.fetch ?? globalThis.fetch;
+		const onResponse = options?.onResponse;
 		const nextOptions = {
 			...(options ?? {}),
 			transport: decision.effectiveTransport,
 			fetch: withDiagnosticFetch(baseFetch, (failure) => {
 				lastFetchFailure = failure;
 			}),
+			onResponse: async (response, responseModel) => {
+				serverRetryAfterMs = retryAfterMs(response.headers, now());
+				await onResponse?.(response, responseModel);
+			},
 		} as TOptions;
-		try {
-			return wrapStream(model, decision, () => lastFetchFailure, invoke(nextOptions));
-		} catch (error) {
-			const message = unexpectedFailure(model, error);
-			finalize(message, decision);
-			const target = createAssistantMessageEventStream();
-			queueMicrotask(() => {
-				target.push({ type: "error", reason: "error", error: message });
-				target.end();
-			});
-			return target;
-		}
+		return wrapStream(
+			model,
+			decision,
+			() => lastFetchFailure,
+			() => serverRetryAfterMs,
+			() => invoke(nextOptions),
+			options?.signal,
+		);
 	};
 
 	const provider: CodexProvider = {
@@ -439,8 +597,20 @@ export function createCodexRecoveryController(
 		provider,
 		getStatus(sessionId) {
 			const state = states.get(sessionId);
+			const capacityState = capacityStates.get(sessionId);
+			const capacityStatus = {
+				capacityCooldownUntil: capacityState?.cooldownUntil,
+				capacityFailures: capacityState?.failures ?? 0,
+				lastCapacityFailure: capacityState?.lastFailure,
+				lastCapacityFailureAt: capacityState?.lastFailureAt,
+			};
 			if (!state) {
-				return { mode: "websocket-preferred", consecutiveSseSuccesses: 0, websocketFailures: 0 };
+				return {
+					mode: "websocket-preferred",
+					consecutiveSseSuccesses: 0,
+					websocketFailures: 0,
+					...capacityStatus,
+				};
 			}
 			return {
 				mode: state.probeInFlight ? "websocket-probe" : "sse-cooldown",
@@ -449,17 +619,24 @@ export function createCodexRecoveryController(
 				websocketFailures: state.websocketFailures,
 				lastFailure: state.lastFailure,
 				lastFailureAt: state.lastFailureAt,
+				...capacityStatus,
 			};
 		},
 		reset(sessionId) {
 			if (sessionId) {
 				advanceGeneration(sessionId);
 				states.delete(sessionId);
+				capacityStates.delete(sessionId);
+				cancelCapacityWaiters(sessionId);
 				resetWebSocketState(sessionId);
 				return;
 			}
-			for (const activeSessionId of activeSessions) advanceGeneration(activeSessionId);
+			for (const activeSessionId of activeSessions) {
+				advanceGeneration(activeSessionId);
+				cancelCapacityWaiters(activeSessionId);
+			}
 			states.clear();
+			capacityStates.clear();
 			resetWebSocketState();
 		},
 	};

@@ -8,7 +8,7 @@ import {
 	type Provider,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
-import { createCodexRecoveryController } from "../src/openai-codex-recovery.ts";
+import { createCodexRecoveryController } from "../src/codex-recovery.ts";
 
 const MODEL = {
 	id: "gpt-test",
@@ -93,7 +93,7 @@ async function complete(
 	provider: Provider<"openai-codex-responses">,
 	options: StreamOptions,
 ): Promise<AssistantMessage> {
-	return provider.stream(MODEL, { messages: [] }, options).result();
+	return provider.stream(MODEL, { messages: [] } as unknown as Parameters<typeof provider.stream>[1], options).result();
 }
 
 test("wraps class-based effective providers without losing auth or dynamic models", async () => {
@@ -122,6 +122,194 @@ test("wraps class-based effective providers without losing auth or dynamic model
 	assert.equal((await complete(recovery.provider, { transport: "auto", sessionId: "class-provider" })).stopReason, "stop");
 });
 
+test("capacity overload delays the next Pi-owned retry without replaying the failed request", async () => {
+	let now = 1_000;
+	const waits: number[] = [];
+	const transports: Array<StreamOptions["transport"]> = [];
+	const responses = [
+		assistant("error", "Codex error: Our servers are currently overloaded. Please try again later."),
+		assistant("stop"),
+	];
+	const base = fakeProvider((options, call) => {
+		transports.push(options?.transport);
+		return terminalStream(responses[call - 1]);
+	});
+	const recovery = createCodexRecoveryController(
+		{ capacityBaseDelayMs: 4_000, capacityMaxDelayMs: 30_000 },
+		{
+			baseProvider: base,
+			now: () => now,
+			random: () => 0.5,
+			sleep: async (ms) => {
+				waits.push(ms);
+				now += ms;
+			},
+			getWebSocketStats: () => undefined,
+			resetWebSocketState: () => {},
+		},
+	);
+	const options = { transport: "auto" as const, sessionId: "capacity-session" };
+
+	const overloaded = await complete(recovery.provider, options);
+	assert.equal(overloaded.stopReason, "error");
+	assert.deepEqual(transports, ["auto"]);
+	assert.equal(recovery.getStatus("capacity-session").capacityFailures, 1);
+	assert.equal(recovery.getStatus("capacity-session").capacityCooldownUntil, 5_000);
+
+	const recovered = await complete(recovery.provider, options);
+	assert.equal(recovered.stopReason, "stop");
+	assert.deepEqual(waits, [4_000]);
+	assert.deepEqual(transports, ["auto", "auto"]);
+	assert.equal(recovery.getStatus("capacity-session").capacityFailures, 0);
+});
+
+test("capacity cooldown honors Retry-After and reset clears it", async () => {
+	const base = fakeProvider((options) => {
+		void options?.onResponse?.({ status: 503, headers: { "retry-after": "12" } }, MODEL);
+		return terminalStream(assistant("error", "503 service unavailable"));
+	});
+	const recovery = createCodexRecoveryController(
+		{ capacityBaseDelayMs: 4_000, capacityMaxDelayMs: 30_000 },
+		{
+			baseProvider: base,
+			now: () => 1_000,
+			random: () => 0.5,
+			getWebSocketStats: () => undefined,
+			resetWebSocketState: () => {},
+		},
+	);
+
+	await complete(recovery.provider, { transport: "auto", sessionId: "retry-after" });
+	assert.equal(recovery.getStatus("retry-after").capacityCooldownUntil, 13_000);
+	recovery.reset("retry-after");
+	assert.equal(recovery.getStatus("retry-after").capacityFailures, 0);
+});
+
+test("a waiting retry rereads a cooldown extended by another in-flight failure", async () => {
+	let now = 1_000;
+	const waits: Array<{ ms: number; wake: () => void }> = [];
+	const sources: AssistantMessageEventStream[] = [];
+	const base = fakeProvider(() => {
+		const source = createAssistantMessageEventStream();
+		sources.push(source);
+		return source;
+	});
+	const recovery = createCodexRecoveryController(
+		{ capacityBaseDelayMs: 4_000, capacityMaxDelayMs: 30_000 },
+		{
+			baseProvider: base,
+			now: () => now,
+			random: () => 0.5,
+			sleep: (ms) => new Promise((resolve) => {
+				const wakeAt = now + ms;
+				waits.push({
+					ms,
+					wake: () => {
+						now = Math.max(now, wakeAt);
+						resolve();
+					},
+				});
+			}),
+			getWebSocketStats: () => undefined,
+			resetWebSocketState: () => {},
+		},
+	);
+	const options = { transport: "auto" as const, sessionId: "capacity-concurrent" };
+	const finish = (source: AssistantMessageEventStream, message: AssistantMessage) => {
+		if (message.stopReason === "error") source.push({ type: "error", reason: "error", error: message });
+		else source.push({ type: "done", reason: "stop", message });
+		source.end();
+	};
+
+	const first = complete(recovery.provider, options);
+	const alreadyInFlight = complete(recovery.provider, options);
+	assert.equal(sources.length, 2);
+	finish(sources[0], assistant("error", "Codex error: Our servers are currently overloaded."));
+	await first;
+
+	const waitingRetry = complete(recovery.provider, options);
+	assert.equal(waits[0]?.ms, 4_000);
+	now = 2_000;
+	finish(sources[1], assistant("error", "Codex error: Our servers are currently overloaded."));
+	await alreadyInFlight;
+	assert.equal(recovery.getStatus("capacity-concurrent").capacityCooldownUntil, 10_000);
+
+	waits.shift()?.wake();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(waits[0]?.ms, 5_000);
+	assert.equal(sources.length, 2);
+	waits.shift()?.wake();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(sources.length, 3);
+	finish(sources[2], assistant("stop"));
+	assert.equal((await waitingRetry).stopReason, "stop");
+});
+
+test("reset aborts a scheduled capacity wait before another provider request starts", async () => {
+	let calls = 0;
+	const base = fakeProvider((_options, call) => {
+		calls = call;
+		return terminalStream(assistant("error", "Codex error: Our servers are currently overloaded."));
+	});
+	const recovery = createCodexRecoveryController(
+		{ capacityBaseDelayMs: 4_000 },
+		{
+			baseProvider: base,
+			random: () => 0.5,
+			getWebSocketStats: () => undefined,
+			resetWebSocketState: () => {},
+		},
+	);
+	const options = { transport: "auto" as const, sessionId: "capacity-reset" };
+	await complete(recovery.provider, options);
+
+	const waitingRetry = complete(recovery.provider, options);
+	recovery.reset("capacity-reset");
+	const aborted = await waitingRetry;
+	assert.equal(aborted.stopReason, "aborted");
+	assert.equal(calls, 1);
+	assert.equal(recovery.getStatus("capacity-reset").capacityFailures, 0);
+});
+
+test("capacity cooldown is abortable before another provider request starts", async () => {
+	let calls = 0;
+	const base = fakeProvider((_options, call) => {
+		calls = call;
+		return terminalStream(assistant("error", "Codex error: Our servers are currently overloaded."));
+	});
+	const recovery = createCodexRecoveryController(
+		{ capacityBaseDelayMs: 4_000 },
+		{
+			baseProvider: base,
+			random: () => 0.5,
+			sleep: async (_ms, signal) => signal?.throwIfAborted(),
+			getWebSocketStats: () => undefined,
+			resetWebSocketState: () => {},
+		},
+	);
+	const options = { transport: "auto" as const, sessionId: "capacity-abort" };
+	await complete(recovery.provider, options);
+	const controller = new AbortController();
+	controller.abort();
+
+	const aborted = await complete(recovery.provider, { ...options, signal: controller.signal });
+	assert.equal(aborted.stopReason, "aborted");
+	assert.equal(calls, 1);
+	assert.equal(recovery.getStatus("capacity-abort").capacityFailures, 1);
+});
+
+test("terminal subscription limits do not arm capacity cooldown", async () => {
+	const base = fakeProvider(() => terminalStream(assistant("error", "Monthly usage limit reached")));
+	const recovery = createCodexRecoveryController({}, {
+		baseProvider: base,
+		getWebSocketStats: () => undefined,
+		resetWebSocketState: () => {},
+	});
+
+	await complete(recovery.provider, { transport: "auto", sessionId: "usage-limit" });
+	assert.equal(recovery.getStatus("usage-limit").capacityFailures, 0);
+});
+
 test("auto mode cools down on websocket failure, uses SSE, then probes websocket", async () => {
 	let now = 1_000;
 	const transports: Array<StreamOptions["transport"]> = [];
@@ -143,7 +331,7 @@ test("auto mode cools down on websocket failure, uses SSE, then probes websocket
 			baseProvider: base,
 			now: () => now,
 			getWebSocketStats: () => undefined,
-			resetWebSocketState: (sessionId) => resets.push(sessionId),
+			resetWebSocketState: (sessionId?: string) => { if (sessionId) resets.push(sessionId); },
 		},
 	);
 	const options = { transport: "auto" as const, sessionId: "session-1" };
@@ -428,7 +616,7 @@ test("explicit transport bypasses adaptive decisions and reset clears cooldown",
 		{
 			baseProvider: base,
 			getWebSocketStats: () => undefined,
-			resetWebSocketState: (sessionId) => resets.push(sessionId),
+			resetWebSocketState: (sessionId?: string) => { if (sessionId) resets.push(sessionId); },
 		},
 	);
 

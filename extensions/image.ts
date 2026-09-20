@@ -1,13 +1,13 @@
 /**
- * Image generation extension for the pi-access package.
- * Uses an existing xAI SuperGrok/X Premium subscription or OpenAI API key.
- * OpenAI Codex ChatGPT OAuth cannot call the Images API.
+ * Image generation extension for the pi-sinan package.
+ * Uses an existing xAI SuperGrok/X Premium or OpenAI ChatGPT/Codex subscription.
  * This file is one extension in a multi-extension package, not a standalone product.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { StringEnum, type Api, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
 	defineTool,
@@ -18,6 +18,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, getImageDimensions } from "@earendil-works/pi-tui";
 import { createImageCardRenderer, normalizePng, type ImageCardData } from "../src/image-preview.ts";
+import {
+	OPENAI_CODEX_IMAGE_MODEL,
+	attemptImageProviders,
+	imageRequestHeaders,
+	openAICodexImageGenerationRequest,
+	openAICodexImageGenerationUrl,
+	xaiImageGenerationUrl,
+	type CredentialProviderId,
+	type ProviderId,
+	type ProviderRequestAuth,
+} from "../src/image-provider.ts";
 
 const XAI_DEFAULT_MODEL = "grok-imagine-image-2.0";
 const XAI_MODELS = new Set([
@@ -25,20 +36,14 @@ const XAI_MODELS = new Set([
 	"grok-imagine-image",
 	"grok-imagine-image-quality",
 ]);
-const OPENAI_DEFAULT_MODEL = "gpt-image-2.5-sunburst";
-const OPENAI_MODELS = new Set([
-	"gpt-image-2.5-sunburst",
-	"gpt-image-2.5-flare",
-]);
+const OPENAI_MODELS = new Set([OPENAI_CODEX_IMAGE_MODEL]);
 const ASPECTS = new Set([
 	"1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2",
 	"9:19.5", "19.5:9", "9:20", "20:9", "1:2", "2:1", "21:9", "5:2", "auto",
 ]);
 
-type ProviderId = "xai" | "openai";
-
-const SETTINGS_KEY = "piAccess";
-const ENTRY_TYPE = "pi-access-image";
+const SETTINGS_KEY = "piSinan";
+const ENTRY_TYPE = "pi-sinan-image";
 
 const DEFAULT_OUTPUT_DIR = ".pi-images";
 
@@ -130,43 +135,81 @@ function errorMessage(parsed: Record<string, unknown>, fallback: string): string
 	return fallback;
 }
 
-async function providerAuth(ctx: ExtensionContext, provider: string): Promise<{ apiKey: string; baseUrl?: string } | undefined> {
-	const status = ctx.modelRegistry.getProviderAuthStatus(provider);
-	if (status && status.configured === false) return undefined;
-	const auth = await ctx.modelRegistry.getProviderAuth(provider);
-	const apiKey = auth?.auth.apiKey ?? await ctx.modelRegistry.getApiKeyForProvider(provider);
-	if (!apiKey) return undefined;
-	return { apiKey, baseUrl: auth?.auth.baseUrl };
+function redactProviderError(message: string, auth: ProviderRequestAuth): string {
+	let redacted = message;
+	const secrets = [auth.apiKey, ...Object.values(auth.headers ?? {})]
+		.filter((value): value is string => typeof value === "string" && value.length > 0);
+	for (const secret of [...new Set(secrets)].sort((left, right) => right.length - left.length)) {
+		redacted = redacted.replaceAll(secret, "[redacted]");
+	}
+	return redacted.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [redacted]").slice(0, 600);
 }
 
-async function resolveProvider(ctx: ExtensionContext, requested?: string): Promise<ProviderId> {
-	if (requested === "openai") {
-		if (await providerAuth(ctx, "openai")) return "openai";
-		throw new Error("OpenAI image generation needs an API key (/login openai or OPENAI_API_KEY). ChatGPT/Codex OAuth cannot call the Images API.");
+function thrownErrorMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	try {
+		return String(error);
+	} catch {
+		return "unknown network error";
 	}
-	if (requested === "xai" || requested === undefined || requested === "auto") {
-		if (await providerAuth(ctx, "xai")) return "xai";
-		if (requested === "xai") {
-			throw new Error("xAI is not configured. Run /login xai (SuperGrok / X Premium) or set XAI_API_KEY.");
-		}
-		if (await providerAuth(ctx, "openai")) return "openai";
-		throw new Error("No image provider. Configure xAI (/login xai) or an OpenAI API key. Codex ChatGPT OAuth is not enough.");
-	}
-	throw new Error(`unsupported provider: ${requested}`);
 }
 
-async function postJson(url: string, apiKey: string, body: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
-	const response = await fetch(url, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			Accept: "application/json",
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(body),
-		signal,
-	});
-	const text = await response.text();
+function isAbort(error: unknown, signal?: AbortSignal): boolean {
+	return (signal?.aborted === true && error === signal.reason)
+		|| (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError"));
+}
+
+function imageAuthFailure(provider: CredentialProviderId): Error {
+	const name = provider === "xai" ? "xAI" : "OpenAI Codex";
+	return new Error(`${name} subscription authentication could not be resolved safely. Run /login and choose ${name}.`);
+}
+
+export async function resolveImageAuth(ctx: ExtensionContext, provider: CredentialProviderId): Promise<ProviderRequestAuth | undefined> {
+	try {
+		const models = ctx.modelRegistry.getAll() as Model<Api>[];
+		const oauthModel = models.find((model) => model.provider === provider && ctx.modelRegistry.isUsingOAuth(model));
+		if (!oauthModel) return undefined;
+		const result = await ctx.modelRegistry.getProviderAuth(provider);
+		if (!result?.auth.apiKey) return undefined;
+		return {
+			apiKey: result.auth.apiKey,
+			baseUrl: result.auth.baseUrl,
+			headers: result.auth.headers,
+		};
+	} catch {
+		// Provider resolvers may include credentials or request details in errors.
+		// Never allow those details to cross the extension boundary.
+		throw imageAuthFailure(provider);
+	}
+}
+
+async function postJson(
+	url: string,
+	auth: ProviderRequestAuth,
+	body: unknown,
+	signal?: AbortSignal,
+	extraHeaders?: Record<string, string>,
+): Promise<Record<string, unknown>> {
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: "POST",
+			headers: imageRequestHeaders(auth, extraHeaders),
+			body: JSON.stringify(body),
+			signal,
+			redirect: "error",
+		});
+	} catch (error) {
+		if (isAbort(error, signal)) throw error;
+		throw new Error(`image request failed: ${redactProviderError(thrownErrorMessage(error), auth)}`);
+	}
+	let text: string;
+	try {
+		text = await response.text();
+	} catch (error) {
+		if (isAbort(error, signal)) throw error;
+		throw new Error(`image response read failed: ${redactProviderError(thrownErrorMessage(error), auth)}`);
+	}
 	let parsed: Record<string, unknown>;
 	try {
 		parsed = JSON.parse(text) as Record<string, unknown>;
@@ -174,7 +217,7 @@ async function postJson(url: string, apiKey: string, body: unknown, signal?: Abo
 		throw new Error(`image API returned non-JSON (HTTP ${response.status})`);
 	}
 	if (!response.ok) {
-		throw new Error(`image generation failed (HTTP ${response.status}): ${errorMessage(parsed, text.slice(0, 300))}`);
+		throw new Error(`image generation failed (HTTP ${response.status}): ${redactProviderError(errorMessage(parsed, text.slice(0, 300)), auth)}`);
 	}
 	return parsed;
 }
@@ -187,16 +230,12 @@ async function decodeImage(parsed: Record<string, unknown>): Promise<Buffer> {
 		return bytes;
 	}
 	if (typeof data?.url === "string") {
-		const response = await fetch(data.url);
-		if (!response.ok) throw new Error(`failed to download image URL (HTTP ${response.status})`);
-		const bytes = Buffer.from(await response.arrayBuffer());
-		if (bytes.length < 32) throw new Error("downloaded image too small");
-		return bytes;
+		throw new Error("image API returned a URL-only payload; only inline b64_json is accepted");
 	}
-	throw new Error("image API did not return b64_json or url");
+	throw new Error("image API did not return the required b64_json payload");
 }
 
-async function generate(input: {
+interface ImageGenerationInput {
 	prompt: string;
 	provider?: string;
 	model?: string;
@@ -204,42 +243,54 @@ async function generate(input: {
 	path: string;
 	signal?: AbortSignal;
 	ctx: ExtensionContext;
-}): Promise<GeneratedImage> {
-	const provider = await resolveProvider(input.ctx, input.provider);
-	if (input.aspect && !ASPECTS.has(input.aspect)) {
-		throw new Error(`unsupported aspect_ratio: ${input.aspect}`);
-	}
-	let bytes: Buffer;
-	let model: string;
+	requestId: string;
+}
+
+async function requestImage(
+	input: ImageGenerationInput,
+	provider: ProviderId,
+	auth: ProviderRequestAuth,
+): Promise<{ bytes: Buffer; model: string }> {
 	if (provider === "xai") {
-		model = input.model ?? XAI_DEFAULT_MODEL;
+		const model = input.model ?? XAI_DEFAULT_MODEL;
 		if (!XAI_MODELS.has(model)) throw new Error(`unsupported xAI image model: ${model}`);
-		const auth = await providerAuth(input.ctx, "xai");
-		if (!auth) throw new Error("xAI auth disappeared");
-		const baseUrl = (auth.baseUrl ?? "https://api.x.ai/v1").replace(/\/$/, "");
-		const parsed = await postJson(`${baseUrl}/images/generations`, auth.apiKey, {
+		const parsed = await postJson(xaiImageGenerationUrl(auth.baseUrl), auth, {
 			model,
 			prompt: input.prompt,
 			n: 1,
 			response_format: "b64_json",
 			...(input.aspect ? { aspect_ratio: input.aspect } : {}),
 		}, input.signal);
-		bytes = await decodeImage(parsed);
-	} else {
-		model = input.model ?? OPENAI_DEFAULT_MODEL;
-		if (!OPENAI_MODELS.has(model)) throw new Error(`unsupported OpenAI image model: ${model}`);
-		const auth = await providerAuth(input.ctx, "openai");
-		if (!auth) throw new Error("OpenAI API key auth disappeared");
-		const baseUrl = (auth.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
-		const parsed = await postJson(`${baseUrl}/images/generations`, auth.apiKey, {
-			model,
-			prompt: input.prompt,
-			n: 1,
-			...(input.aspect && input.aspect !== "auto" ? { size: input.aspect === "16:9" ? "1536x1024" : input.aspect === "9:16" ? "1024x1536" : "1024x1024" } : {}),
-		}, input.signal);
-		bytes = await decodeImage(parsed);
+		return { bytes: await decodeImage(parsed), model };
 	}
-	// Providers may return JPEG even when the requested output path ends in .png.
+
+	const model = input.model ?? OPENAI_CODEX_IMAGE_MODEL;
+	if (!OPENAI_MODELS.has(model)) throw new Error(`unsupported OpenAI subscription image model: ${model}`);
+	const parsed = await postJson(
+		openAICodexImageGenerationUrl(auth.baseUrl),
+		auth,
+		openAICodexImageGenerationRequest(input.prompt, input.aspect),
+		input.signal,
+		{
+			originator: "pi-sinan",
+			"x-codex-image-turn-id": input.requestId,
+		},
+	);
+	return { bytes: await decodeImage(parsed), model };
+}
+
+async function generate(input: ImageGenerationInput): Promise<GeneratedImage> {
+	if (input.aspect && !ASPECTS.has(input.aspect)) {
+		throw new Error(`unsupported aspect_ratio: ${input.aspect}`);
+	}
+	const generated = await attemptImageProviders(
+		input.provider,
+		(credentialProvider) => resolveImageAuth(input.ctx, credentialProvider),
+		({ provider, auth }) => requestImage(input, provider, auth),
+		() => input.signal?.aborted === true,
+	);
+	let { bytes } = generated.value;
+	// Provider fallback ends once image bytes exist: normalization/write failures must not spend a second subscription.
 	bytes = await normalizePng(bytes);
 	await withFileMutationQueue(input.path, async () => {
 		await mkdir(dirname(input.path), { recursive: true, mode: 0o700 });
@@ -247,8 +298,8 @@ async function generate(input: {
 	});
 	return {
 		path: input.path,
-		provider,
-		model,
+		provider: generated.provider,
+		model: generated.value.model,
 		bytes: bytes.length,
 		dataBase64: bytes.toString("base64"),
 	};
@@ -302,27 +353,27 @@ export default function (pi: ExtensionAPI) {
 	const generateImageTool = defineTool({
 	name: "generate_image",
 	label: "Generate Image",
-	description: "Generate one image with the signed-in xAI SuperGrok/X Premium subscription or an OpenAI API key, then save a PNG in the workspace. ChatGPT/Codex OAuth cannot generate images.",
-	promptSnippet: "Generate an image via xAI Imagine or OpenAI Images and save a PNG locally",
+	description: "Generate one image with a signed-in xAI SuperGrok/X Premium or OpenAI ChatGPT/Codex subscription, then save a PNG in the workspace.",
+	promptSnippet: "Generate an image via an xAI or OpenAI subscription and save a PNG locally",
 	promptGuidelines: [
 		"Use generate_image when the user asks to create, draw, or generate an image file.",
-		"generate_image uses existing Pi login: xAI subscription/API key, or OpenAI API key. Do not ask for a new key if those are configured.",
-		"OpenAI Codex/ChatGPT OAuth cannot generate images. Do not switch to gpt-6-astra hoping it will emit a PNG.",
+		"generate_image uses existing Pi subscription login: xAI first, then OpenAI Codex when provider is auto. Do not ask for an API key.",
+		"When generate_image provider is explicitly xai or openai, do not silently switch providers after a failure.",
 		"After generate_image succeeds, report the saved path and which provider produced it.",
-		"generate_image shows the original image in the conversation when piAccess.image.showInConversation is true; do not set show_in_conversation unless the user asked to override that setting.",
+		"generate_image shows the original image in the conversation when piSinan.image.showInConversation is true; do not set show_in_conversation unless the user asked to override that setting.",
 		"generate_image returns file metadata, not image content to the model. Read the saved image only when visual inspection is needed.",
 	],
 	parameters: Type.Object({
 		prompt: Type.String({ description: "Image prompt" }),
 		path: Type.Optional(Type.String({ description: "Workspace-relative PNG path. Default: .pi-images/<timestamp>.png" })),
 		aspect_ratio: Type.Optional(Type.String({ description: "Optional aspect ratio such as 1:1, 16:9, 9:16, auto" })),
-		provider: Type.Optional(Type.String({ description: "xai, openai, or auto (default auto)" })),
+		provider: Type.Optional(StringEnum(["auto", "xai", "openai"] as const, { description: "Subscription provider: auto (xAI then OpenAI), xai, or openai" })),
 		model: Type.Optional(Type.String({ description: "Provider image model override" })),
-		show_in_conversation: Type.Optional(Type.Boolean({ description: "Override piAccess.image.showInConversation for this call" })),
+		show_in_conversation: Type.Optional(Type.Boolean({ description: "Override piSinan.image.showInConversation for this call" })),
 	}),
-	async execute(_toolCallId, params, signal, onUpdate, ctx) {
+	async execute(toolCallId, params, signal, onUpdate, ctx) {
 		const path = outputPath(ctx.cwd, params.path);
-		onUpdate?.({ content: [{ type: "text", text: "Generating image…" }] });
+		onUpdate?.({ content: [{ type: "text", text: "Generating image…" }], details: undefined });
 		const result = await generate({
 			prompt: params.prompt,
 			provider: params.provider,
@@ -331,6 +382,7 @@ export default function (pi: ExtensionAPI) {
 			path,
 			signal,
 			ctx,
+			requestId: toolCallId,
 		});
 		const preview = showInConversation(params.show_in_conversation);
 		const summary = `Generated with ${result.provider}/${result.model}: ${result.path} (${result.bytes} bytes)`;
@@ -353,25 +405,25 @@ export default function (pi: ExtensionAPI) {
 		return cards.render(entry.data, expanded, theme);
 	});
 	pi.registerCommand("image", {
-		description: "Generate an image: /image <prompt> [--path file.png] [--aspect 16:9] [--provider xai|openai] [--preview|--no-preview]. /image config [on|off|dir <path>] configures preview and output directory.",
+		description: "Generate an image: /image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]. /image config [on|off|dir <path>] configures preview and output directory.",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "config" || trimmed.startsWith("config ")) {
 				const rest = trimmed.slice("config".length).trim();
 				if (rest === "on" || rest === "off") {
 					writeImageSettings({ showInConversation: rest === "on" });
-					ctx.ui.notify(`piAccess.image.showInConversation = ${rest === "on"}`, "success");
+					ctx.ui.notify(`piSinan.image.showInConversation = ${rest === "on"}`, "info");
 					return;
 				}
 				if (rest.startsWith("dir ") || rest === "dir") {
 					const dir = rest.slice("dir".length).trim();
 					if (!dir) {
-						ctx.ui.notify(`piAccess.image.outputDir = ${readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR}`, "info");
+						ctx.ui.notify(`piSinan.image.outputDir = ${readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR}`, "info");
 						return;
 					}
 					workspaceDir(ctx.cwd, dir);
 					writeImageSettings({ outputDir: dir });
-					ctx.ui.notify(`piAccess.image.outputDir = ${dir}`, "success");
+					ctx.ui.notify(`piSinan.image.outputDir = ${dir}`, "info");
 					return;
 				}
 				const currentDir = readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR;
@@ -380,7 +432,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const parsed = parseCommand(trimmed);
 			if (!parsed.prompt) {
-				ctx.ui.notify("Usage: /image <prompt> [--path file.png] [--aspect 16:9] [--provider xai|openai] [--preview|--no-preview]", "warning");
+				ctx.ui.notify("Usage: /image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]", "warning");
 				return;
 			}
 			try {
@@ -390,12 +442,13 @@ export default function (pi: ExtensionAPI) {
 					aspect: parsed.aspect,
 					path: outputPath(ctx.cwd, parsed.path),
 					ctx,
+					requestId: randomUUID(),
 				});
 				const preview = showInConversation(parsed.preview);
 				const data = await cardData(result, preview);
 				cards.markLive(data);
 				pi.appendEntry(ENTRY_TYPE, data);
-				ctx.ui.notify(`Saved ${result.path} (${result.provider}/${result.model})`, "success");
+				ctx.ui.notify(`Saved ${result.path} (${result.provider}/${result.model})`, "info");
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}

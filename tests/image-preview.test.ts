@@ -16,7 +16,7 @@ function theme() {
 }
 
 function writeCard(bytes: Buffer, name: string) {
-	const dir = mkdtempSync(join(tmpdir(), "pi-access-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-sinan-"));
 	const path = join(dir, name);
 	writeFileSync(path, bytes);
 	return path;

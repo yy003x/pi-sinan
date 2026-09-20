@@ -1,109 +1,187 @@
-# pi-access
+# pi-sinan
 
-A [Pi](https://pi.dev) package that can host **multiple extensions**. Each file in `extensions/` is a separate extension. This repository is not a single-feature image product.
+`pi-sinan` is a multi-extension [Pi](https://pi.dev) package for capabilities
+backed by existing **xAI/Grok** and **OpenAI/Codex** subscriptions. It does not
+use separately billed OpenAI Platform image/search APIs.
 
-Install from Git (no npm account required):
-
-```bash
-pi install git:github.com/yy003x/pi-access
-```
-
-or:
+## Install
 
 ```bash
-pi install git@github.com:yy003x/pi-access.git
+pi install git:github.com/yy003x/pi-sinan
 ```
 
-Then `/reload`.
+Then run `/reload`. This repository requires Pi 0.85.1 or newer and is tested
+against Pi 0.86.0.
 
-## Layout
+## Package architecture
+
+Pi loads each file below as an independent extension:
 
 ```text
 extensions/
-  image.ts                    # generate images with xAI subscription or OpenAI API key
-  openai-codex-recovery.ts    # adaptive WebSocket/SSE recovery for OpenAI Codex
+  image.ts            # /image and generate_image
+  search.ts           # /sn-search
+  usage.ts            # /usage, cache, refresh, status and events
+  footer.ts           # package-local two/three-line TUI footer
+  codex-recovery.ts   # /codex-recovery and OpenAI transport recovery
 ```
 
-Add another capability by adding another `extensions/<name>.ts` that `export default function (pi)`. Pi loads every `.ts` / `.js` file in this directory. Keep tests outside `extensions/` so they are not loaded as extensions.
+| Capability | xAI/Grok subscription | OpenAI/Codex subscription |
+| --- | --- | --- |
+| Image generation | Yes | Yes |
+| Hosted web search | Yes (default) | Yes (explicit only) |
+| Read-only quota usage | Yes | Yes |
+| Inline footer quota | Yes | Yes |
+| Transport/capacity recovery | No | Yes |
 
-Disable one resource without removing the package:
+Resources can be selected without splitting the package, for example:
 
 ```json
 {
   "packages": [
     {
-      "source": "git:github.com/yy003x/pi-access",
-      "extensions": ["image"]
+      "source": "git:github.com/yy003x/pi-sinan",
+      "extensions": ["image", "search", "usage", "footer", "codex-recovery"]
     }
   ]
 }
 ```
 
-## Extensions
+## Commands and tool
 
-### openai-codex-recovery
-
-Requires Pi 0.85.1 or newer. Wraps the current effective `openai-codex` provider without replacing its OAuth flow or model catalog.
-When `transport` is `"auto"`, it:
-
-- prefers Pi's normal cached WebSocket path;
-- uses SSE during a two-minute cooldown after a WebSocket transport failure;
-- probes WebSocket again after three successful SSE requests or when the cooldown expires;
-- allows only one concurrent recovery probe per session;
-- includes nested network error codes such as `ECONNRESET` in SSE `fetch failed` errors and diagnostics.
-
-Explicit `"sse"`, `"websocket"`, and `"websocket-cached"` settings are passed through without adaptive selection. Use `/codex-recovery` to inspect the current session state, or `/codex-recovery reset` to clear it and prefer WebSocket again.
-
-This extension changes only `openai-codex` transport selection. It does not read or store OAuth tokens, request bodies, or authentication headers.
-
-### image
+### Image
 
 - Tool: `generate_image`
-- Command: `/image <prompt> [--path file.png] [--aspect 16:9] [--provider xai|openai]`
+- Command: `/image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai]`
 
-| Provider | Works | How |
-| --- | --- | --- |
-| **xAI** | Yes | `/login xai` (SuperGrok / X Premium) or `XAI_API_KEY` |
-| **OpenAI API key** | Yes | `/login openai` or `OPENAI_API_KEY` |
-| **OpenAI Codex / ChatGPT OAuth** | No | Missing Images API scopes |
+`auto` tries xAI first and OpenAI second only when xAI is unavailable or its
+generation request fails. An explicit provider never crosses to the other
+subscription. Once provider bytes exist, local conversion/write failures do
+not trigger another generation. Output defaults to
+`.pi-images/<timestamp>.png`; returned JPEG data is normalized to PNG.
 
-Default provider is `auto`: xAI if configured, otherwise OpenAI API key.
-
-Default output: `.pi-images/<timestamp>.png` under the current workspace. Generated files are always PNG; xAI JPEG payloads are converted before writing. Change the directory with `/image config dir <path>` or:
-
-```json
-{
-  "piAccess": {
-    "image": {
-      "outputDir": ".pi-images"
-    }
-  }
-}
-```
-
-### Show in the conversation
-
-By default the original image is shown in the main chat (`generate_image` and `/image`) at native pixel size. It may shrink to fit a narrower terminal, but it is never upscaled. The file is linked, not sent to the model. Newly generated cards are visible immediately; restored history stays collapsed until you expand it with Ctrl+O. This needs a terminal with inline images (Kitty, iTerm2, or `PI_IMAGE_PROTOCOL`). Turn it off to skip the inline image:
-
-```json
-{
-  "piAccess": {
-    "image": {
-      "showInConversation": false
-    }
-  }
-}
-```
-
-Or:
+OpenAI resolves Pi's internal `openai-codex` OAuth credential and calls the
+official ChatGPT Codex image endpoint with `gpt-image-2`. xAI uses
+`grok-imagine-image-2.0` by default.
 
 ```text
-/image config off
+/image a watercolor observatory at dusk
+/image a wide product sketch --aspect 16:9 --provider openai
 /image config on
+/image config off
 /image config dir .pi-images
-/image a cat --no-preview
 ```
 
-## Gallery / npm
+### Search
 
-The official [pi.dev/packages](https://pi.dev/packages) catalog only lists npm packages with the `pi-package` keyword. This git install path does not require an npm account. If you later publish `npm:pi-access`, keep this repo as the multi-extension source; do not split each extension into a separate unique product unless it outgrows the package.
+- Command: `/sn-search <query> [--provider xai|openai]`
+- Default and strict provider: `xai`
+
+xAI uses its hosted Responses `web_search`. OpenAI is used only with explicit
+`--provider openai` and calls the official ChatGPT Codex Responses endpoint.
+Both paths require cited HTTP(S) sources; failures never cross providers.
+
+```text
+/sn-search latest TypeScript release notes
+/sn-search current Codex documentation --provider openai
+```
+
+### Usage
+
+- Command: `/usage`
+
+Usage follows the provider of the current model and supports only
+`openai-codex` and `xai`. It performs read-only official quota requests,
+refreshes automatically after model/session activity, caches successful
+reports for five minutes, and backs off failures for 30 seconds. It publishes
+plain `setStatus("pi-sinan-usage", ...)` text and structured
+`pi-sinan/usage-status/v1` events. No Codex credit redemption or other quota
+write operation exists.
+
+### Footer
+
+The independent footer extension consumes the package's `pi-sinan-usage`
+status. It preserves native token/context/model information, cwd, Git branch,
+session name, cache/cost details, narrow-terminal degradation, and statuses
+owned by other extensions. It has no dependency on an externally installed
+usage package.
+
+### Codex recovery
+
+- Command: `/codex-recovery`
+- Command: `/codex-recovery reset`
+
+For OpenAI Codex only, automatic transport mode prefers Pi's cached WebSocket,
+uses SSE during a two-minute cooldown after a transport failure, and probes
+WebSocket again after successful SSE requests or cooldown expiry. Capacity
+errors add bounded, abortable delay before Pi's next retry. Explicit transport
+settings pass through unchanged. The reset command clears only in-memory
+transport/capacity recovery state; it does not modify subscription quota.
+
+## Configuration
+
+All package configuration uses the new `piSinan` namespace. Image command
+configuration is stored in global `~/.pi/agent/settings.json`; usage and footer
+settings may also be overridden in a trusted project's `.pi/settings.json`:
+
+```json
+{
+  "piSinan": {
+    "image": {
+      "outputDir": ".pi-images",
+      "showInConversation": true
+    },
+    "usage": {
+      "displayMode": "remaining",
+      "refreshMs": 300000
+    },
+    "footer": {
+      "enabled": true
+    }
+  }
+}
+```
+
+`usage.displayMode` is `remaining` or `used`; `refreshMs` must be at least
+30 seconds. Generated paths must remain inside the current workspace.
+
+## Authentication and safety boundaries
+
+- Sign in through Pi `/login`; image, search, and usage accept Pi OAuth only.
+- Credentials are resolved at request time through Pi's model registry. They
+  are not written to settings, session entries, status/events, errors, or
+  usage caches.
+- Usage, OpenAI image, and hosted search credentials fail closed to their
+  official HTTPS endpoints. Redirects are rejected for all authenticated
+  requests.
+- Image generation accepts only the requested inline `b64_json` payload;
+  provider-returned URLs are never fetched.
+- Validation tests use mocked requests and do not consume subscription quota.
+- Account entitlement and provider-side rollout remain account-dependent; no
+  live request is made during installation or tests.
+
+## Migration from pi-access
+
+Version `0.2.0` is a breaking rename. Migrate in this order so Pi never loads
+duplicate commands, tools, providers, or footers:
+
+1. Remove both superseded packages:
+   ```bash
+   pi remove git:git@github.com:yy003x/pi-access.git
+   pi remove npm:@specode/pi-subscription-usage
+   ```
+2. Remove the old standalone `subscription-inline-footer.ts` from your Pi
+   extensions directory (if present).
+3. Install the renamed package:
+   ```bash
+   pi install git:github.com/yy003x/pi-sinan
+   ```
+4. Run `/reload` in Pi.
+
+Then replace configuration root `piAccess` with `piSinan` and use the extension
+name `codex-recovery`. Old package names, configuration keys, headers, symbols,
+entries, messages, and markers are not read or retained as compatibility
+aliases.
+
+The package is MIT licensed. Selectively adapted usage sources and attribution
+are documented in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).

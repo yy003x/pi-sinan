@@ -4,7 +4,7 @@ import {
 	createCodexRecoveryController,
 	type CodexRecoveryController,
 	type CodexRecoveryStatus,
-} from "../src/openai-codex-recovery.ts";
+} from "../src/codex-recovery.ts";
 
 function statusText(status: CodexRecoveryStatus): string {
 	const parts = [
@@ -14,6 +14,11 @@ function statusText(status: CodexRecoveryStatus): string {
 	];
 	if (status.fallbackUntil) parts.push(`fallbackUntil=${new Date(status.fallbackUntil).toISOString()}`);
 	if (status.lastFailure) parts.push(`lastFailure=${status.lastFailure}`);
+	parts.push(`capacityFailures=${status.capacityFailures}`);
+	if (status.capacityCooldownUntil) {
+		parts.push(`capacityCooldownUntil=${new Date(status.capacityCooldownUntil).toISOString()}`);
+	}
+	if (status.lastCapacityFailure) parts.push(`lastCapacityFailure=${status.lastCapacityFailure}`);
 	return parts.join(" ");
 }
 
@@ -23,7 +28,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		const effectiveProvider = ctx.modelRegistry.getProvider("openai-codex");
 		if (!effectiveProvider) {
-			ctx.ui.notify("pi-access: openai-codex provider is unavailable; transport recovery was not installed.", "warning");
+			ctx.ui.notify("pi-sinan: openai-codex provider is unavailable; transport recovery was not installed.", "warning");
 			return;
 		}
 		recovery = createCodexRecoveryController({}, {
