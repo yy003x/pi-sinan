@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import usageExtension from "../extensions/usage.ts";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import usageExtension, { type UsageExtensionDependencies } from "../extensions/usage.ts";
 import {
 	USAGE_CACHE_TTL_MS,
 	USAGE_FAILURE_BACKOFF_MS,
@@ -50,7 +50,8 @@ test("Codex quota parsing normalizes official primary and secondary windows", ()
 		{ id: "codex:secondary", groupId: "codex", used: 60, remaining: 40, windowMinutes: 10_080 },
 	]);
 	assert.equal(report.defaultGroupId, "codex");
-	assert.equal("metrics" in report, false, "credit/reset metadata is intentionally not modeled");
+	assert.equal(report.resetCreditsAvailable, 4);
+	assert.match(formatUsageReport({ status: "ready", report }, "remaining"), /Resets left: 4/);
 });
 
 test("Codex additional model groups stay distinct and status selects the current model group", () => {
@@ -206,6 +207,9 @@ test("cache TTL, refresh/backoff constants, and structured status stay credentia
 	const cache = new UsageCache(100);
 	cache.set("openai-codex", "secret-fingerprint", report, 1_000);
 	assert.equal(cache.get("openai-codex", "secret-fingerprint", 1_099), report);
+	cache.clearProvider("openai-codex");
+	assert.equal(cache.get("openai-codex", "secret-fingerprint", 1_099), undefined);
+	cache.set("openai-codex", "secret-fingerprint", report, 1_000);
 	assert.equal(cache.get("openai-codex", "secret-fingerprint", 1_100), undefined);
 	assert.equal(USAGE_CACHE_TTL_MS, 300_000);
 	assert.equal(USAGE_FAILURE_BACKOFF_MS, 30_000);
@@ -215,19 +219,19 @@ test("cache TTL, refresh/backoff constants, and structured status stay credentia
 	assert.doesNotMatch(JSON.stringify(event), /secret|authorization|token/iu);
 });
 
-test("unsupported providers expose no Kimi, OpenCode, or reset-credit functionality", () => {
+test("unsupported providers expose no Kimi or OpenCode functionality", () => {
 	assert.equal(usageProviderForModel({ provider: "kimi-coding", id: "x" }), undefined);
 	assert.equal(usageProviderForModel({ provider: "opencode-go", id: "x" }), undefined);
 	assert.equal(usageProviderForModel({ provider: "openai-codex", id: "x" }), "openai-codex");
 	assert.throws(() => usageEndpoint("openai-codex", "monthly"), /Unsupported/);
 });
 
-test("/usage discards an in-flight result after model identity changes", async () => {
+test("/sn-usage discards an in-flight result after model identity changes", async () => {
 	let usageHandler: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
 	const emitted: unknown[] = [];
 	const pi = {
 		registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) {
-			if (name === "usage") usageHandler = command.handler;
+			if (name === "sn-usage") usageHandler = command.handler;
 		},
 		on() {},
 		events: { emit(_name: string, value: unknown) { emitted.push(value); } },
@@ -265,4 +269,207 @@ test("/usage discards an in-flight result after model identity changes", async (
 	assert.deepEqual(notifications, ["Usage result was discarded because the selected model changed during the query."]);
 	assert.deepEqual(statuses, []);
 	assert.equal(emitted.some((value) => (value as { status?: unknown }).status === "ready"), false);
+});
+
+test("/sn-usage allows only one concurrent Codex reset redemption", async () => {
+	let usageHandler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+	const pi = {
+		registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
+			if (name === "sn-usage") usageHandler = command.handler;
+		},
+		on() {},
+		events: { emit() {} },
+	} as unknown as ExtensionAPI;
+	const resetAuth = {
+		providerId: "openai-codex" as const,
+		headers: { Authorization: "Bearer token", "chatgpt-account-id": "account" },
+		fingerprint: "reset-fingerprint",
+		secrets: ["token", "account"],
+	};
+	let releaseConsume: ((value: { code: "reset"; windowsReset: number }) => void) | undefined;
+	let markConsumeStarted: (() => void) | undefined;
+	const consumeStarted = new Promise<void>((resolve) => { markConsumeStarted = resolve; });
+	const requestIds: string[] = [];
+	const dependencies: UsageExtensionDependencies = {
+		queryUsage: async () => normalizeCodexUsage({
+			rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18_000 } },
+			rate_limit_reset_credits: { available_count: 1 },
+		}),
+		resolveCodexResetAuth: async () => resetAuth,
+		listCodexResetCredits: async () => ({
+			availableCount: 1,
+			options: [{ creditId: "credit-1", title: "Full Reset", description: "Reset windows" }],
+		}),
+		consumeCodexResetCredit: async (_auth, _option, requestId) => {
+			requestIds.push(requestId);
+			markConsumeStarted?.();
+			return new Promise((resolve) => { releaseConsume = resolve; });
+		},
+		createResetRequestId: () => "request-123",
+	};
+	usageExtension(pi, dependencies);
+	assert.ok(usageHandler);
+
+	const notices: string[] = [];
+	const model = { provider: "openai-codex", id: "gpt-5.6-sol", baseUrl: "https://chatgpt.com/backend-api" };
+	const ctx = {
+		hasUI: true,
+		model,
+		modelRegistry: {
+			isUsingOAuth: () => true,
+			getProviderAuth: async () => ({ auth: { apiKey: "token", headers: {} } }),
+		},
+		ui: {
+			notify(message: string) { notices.push(message); },
+			setStatus() {},
+			select: async (title: string, options: string[]) => {
+				if (title.startsWith("Reset credits:")) return "Redeem 1 Reset";
+				if (title === "Choose a Codex reset") return options[0];
+				if (title.startsWith("Redeem one Codex reset?")) return "Redeem 1 Reset (Irreversible)";
+				return undefined;
+			},
+		},
+	} as unknown as ExtensionCommandContext;
+	const first = usageHandler!("", ctx);
+	await consumeStarted;
+	await usageHandler!("", ctx);
+	assert.deepEqual(requestIds, ["request-123"]);
+	assert.match(notices.join("\n"), /already in progress/);
+	releaseConsume?.({ code: "reset", windowsReset: 1 });
+	await first;
+	assert.deepEqual(requestIds, ["request-123"]);
+	assert.match(notices.join("\n"), /Reset redeemed/);
+});
+
+test("/sn-usage fails closed when Codex reset credits cannot be verified", async () => {
+	let usageHandler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+	const pi = {
+		registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
+			if (name === "sn-usage") usageHandler = command.handler;
+		},
+		on() {},
+		events: { emit() {} },
+	} as unknown as ExtensionAPI;
+	let consumeCalls = 0;
+	const dependencies: UsageExtensionDependencies = {
+		queryUsage: async () => normalizeCodexUsage({
+			rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18_000 } },
+			rate_limit_reset_credits: { available_count: 1 },
+		}),
+		resolveCodexResetAuth: async () => ({
+			providerId: "openai-codex",
+			headers: { Authorization: "Bearer token", "chatgpt-account-id": "account" },
+			fingerprint: "reset-fingerprint",
+			secrets: ["token", "account"],
+		}),
+		listCodexResetCredits: async () => { throw new Error("credit verification failed"); },
+		consumeCodexResetCredit: async () => {
+			consumeCalls += 1;
+			return { code: "reset", windowsReset: 1 };
+		},
+		createResetRequestId: () => "request-123",
+	};
+	usageExtension(pi, dependencies);
+	const notices: string[] = [];
+	const model = { provider: "openai-codex", id: "gpt-5.6-sol", baseUrl: "https://chatgpt.com/backend-api" };
+	await usageHandler!("", {
+		hasUI: true,
+		model,
+		modelRegistry: {
+			isUsingOAuth: () => true,
+			getProviderAuth: async () => ({ auth: { apiKey: "token", headers: {} } }),
+		},
+		ui: {
+			notify(message: string) { notices.push(message); },
+			setStatus() {},
+			select: async (title: string) => title.startsWith("Reset credits:") ? "Redeem 1 Reset" : undefined,
+		},
+	} as unknown as ExtensionCommandContext);
+	assert.equal(consumeCalls, 0);
+	assert.match(notices.join("\n"), /credit verification failed/);
+});
+
+test("Codex reset fences pre-reset usage results from cache and publication", async () => {
+	let usageHandler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
+	const pi = {
+		registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) {
+			if (name === "sn-usage") usageHandler = command.handler;
+		},
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void) { handlers.set(event, handler); },
+		events: { emit() {} },
+	} as unknown as ExtensionAPI;
+	const report = (used: number, resetCreditsAvailable: number) => normalizeCodexUsage({
+		rate_limit: { primary_window: { used_percent: used, limit_window_seconds: 18_000 } },
+		rate_limit_reset_credits: { available_count: resetCreditsAvailable },
+	});
+	let queryCall = 0;
+	let releaseOldQuery: ((value: ReturnType<typeof report>) => void) | undefined;
+	let markOldQueryStarted: (() => void) | undefined;
+	const oldQueryStarted = new Promise<void>((resolve) => { markOldQueryStarted = resolve; });
+	const dependencies: UsageExtensionDependencies = {
+		queryUsage: async () => {
+			queryCall += 1;
+			if (queryCall === 1) return report(10, 0);
+			if (queryCall === 2) {
+				markOldQueryStarted?.();
+				return new Promise((resolve) => { releaseOldQuery = resolve; });
+			}
+			if (queryCall === 3) return report(90, 1);
+			if (queryCall === 4) return report(5, 0);
+			throw new Error(`Unexpected usage query ${queryCall}`);
+		},
+		resolveCodexResetAuth: async () => ({
+			providerId: "openai-codex",
+			headers: { Authorization: "Bearer token", "chatgpt-account-id": "account" },
+			fingerprint: "reset-fingerprint",
+			secrets: ["token", "account"],
+		}),
+		listCodexResetCredits: async () => ({
+			availableCount: 1,
+			options: [{ creditId: "credit-1", title: "Full Reset", description: "Reset windows" }],
+		}),
+		consumeCodexResetCredit: async () => ({ code: "reset", windowsReset: 1 }),
+		createResetRequestId: () => "request-123",
+	};
+	usageExtension(pi, dependencies);
+	assert.ok(usageHandler);
+
+	const statuses: string[] = [];
+	const model = { provider: "openai-codex", id: "gpt-5.6-sol", baseUrl: "https://chatgpt.com/backend-api" };
+	const ctx = {
+		cwd: process.cwd(),
+		hasUI: true,
+		model,
+		isProjectTrusted: () => false,
+		modelRegistry: {
+			isUsingOAuth: () => true,
+			getProviderAuth: async () => ({ auth: { apiKey: "token", headers: {} } }),
+		},
+		ui: {
+			notify() {},
+			setStatus(_key: string, value: string | undefined) { if (value) statuses.push(value); },
+			select: async (title: string, options: string[]) => {
+				if (title.startsWith("Reset credits:")) return "Redeem 1 Reset";
+				if (title === "Choose a Codex reset") return options[0];
+				if (title.startsWith("Redeem one Codex reset?")) return "Redeem 1 Reset (Irreversible)";
+				return undefined;
+			},
+		},
+	} as unknown as ExtensionCommandContext;
+	handlers.get("session_start")?.({}, ctx);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(statuses.at(-1), "5h 90%");
+
+	const staleCommand = usageHandler!("", ctx);
+	await oldQueryStarted;
+	await usageHandler!("", ctx);
+	assert.equal(statuses.at(-1), "5h 95%");
+	releaseOldQuery?.(report(90, 1));
+	await staleCommand;
+	handlers.get("agent_settled")?.({}, ctx);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(queryCall, 4, "post-reset cache should satisfy the next automatic refresh");
+	assert.equal(statuses.at(-1), "5h 95%");
+	handlers.get("session_shutdown")?.({}, ctx);
 });

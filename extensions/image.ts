@@ -404,8 +404,8 @@ export default function (pi: ExtensionAPI) {
 		if (!entry.data?.path) return new Text("[image] Missing file path", 0, 0);
 		return cards.render(entry.data, expanded, theme);
 	});
-	pi.registerCommand("image", {
-		description: "Generate an image: /image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]. /image config [on|off|dir <path>] configures preview and output directory.",
+	pi.registerCommand("sn-image", {
+		description: "Generate an image: /sn-image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]. /sn-image config [on|off|dir <path>] configures preview and output directory.",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "config" || trimmed.startsWith("config ")) {
@@ -427,12 +427,12 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const currentDir = readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR;
-				ctx.ui.notify(`showInConversation=${showInConversation()} outputDir=${currentDir}. /image config on|off|dir <path>`, "info");
+				ctx.ui.notify(`showInConversation=${showInConversation()} outputDir=${currentDir}. /sn-image config on|off|dir <path>`, "info");
 				return;
 			}
 			const parsed = parseCommand(trimmed);
 			if (!parsed.prompt) {
-				ctx.ui.notify("Usage: /image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]", "warning");
+				ctx.ui.notify("Usage: /sn-image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]", "warning");
 				return;
 			}
 			try {

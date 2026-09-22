@@ -3,6 +3,7 @@ import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import codexRecoveryExtension from "../extensions/codex-recovery.ts";
+import fastExtension from "../extensions/fast.ts";
 import footerExtension from "../extensions/footer.ts";
 import imageExtension from "../extensions/image.ts";
 import searchExtension from "../extensions/search.ts";
@@ -37,12 +38,12 @@ function registry() {
 	return { api, commands, tools, handlers };
 }
 
-test("all five extensions load and register unique public commands/tools", () => {
+test("all six extensions load and register unique public commands/tools", () => {
 	const loaded = registry();
-	for (const extension of [imageExtension, searchExtension, usageExtension, footerExtension, codexRecoveryExtension]) {
+	for (const extension of [imageExtension, searchExtension, usageExtension, footerExtension, codexRecoveryExtension, fastExtension]) {
 		extension(loaded.api);
 	}
-	assert.deepEqual([...loaded.commands.keys()].sort(), ["codex-recovery", "image", "sn-search", "usage"]);
+	assert.deepEqual([...loaded.commands.keys()].sort(), ["sn-fast", "sn-image", "sn-recovery", "sn-search", "sn-usage"]);
 	assert.deepEqual([...loaded.tools].sort(), ["generate_image"]);
 	assert.ok(loaded.handlers.some(({ event }) => event === "session_start"));
 });
@@ -98,7 +99,7 @@ test("image rejects API-key-only catalogs without resolving provider credentials
 	const harness = commandHarness(imageExtension);
 	const ctx = authContext({ oauth: false });
 	(ctx as unknown as { ui: typeof harness.ui }).ui = harness.ui;
-	await harness.command("image")?.("draw a cat --provider xai", ctx);
+	await harness.command("sn-image")?.("draw a cat --provider xai", ctx);
 	assert.match(harness.notices.join("\n"), /xAI subscription is not configured/);
 	assert.doesNotMatch(harness.notices.join("\n"), /api-key-must-not-be-used/);
 });
@@ -107,7 +108,7 @@ test("image resolver exceptions are replaced before reaching command UI", async 
 	const harness = commandHarness(imageExtension);
 	const ctx = authContext({ oauth: true, resolverThrows: true });
 	(ctx as unknown as { ui: typeof harness.ui }).ui = harness.ui;
-	await harness.command("image")?.("draw a cat --provider xai", ctx);
+	await harness.command("sn-image")?.("draw a cat --provider xai", ctx);
 	const message = harness.notices.join("\n");
 	assert.match(message, /xAI subscription authentication could not be resolved safely/);
 	assert.doesNotMatch(message, /image-secret|Bearer|token=private/);
@@ -127,7 +128,7 @@ test("image POST rejects redirects and redacts fetch exceptions before command U
 		throw new Error("network exposed oauth-image-secret and account-image-secret");
 	}) as typeof fetch;
 	try {
-		await harness.command("image")?.("draw a cat --provider xai", ctx);
+		await harness.command("sn-image")?.("draw a cat --provider xai", ctx);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -153,7 +154,7 @@ test("image redacts response read exceptions before command UI", async () => {
 		},
 	}) as unknown as Response) as typeof fetch;
 	try {
-		await harness.command("image")?.("draw a cat --provider xai", ctx);
+		await harness.command("sn-image")?.("draw a cat --provider xai", ctx);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
@@ -178,7 +179,7 @@ test("image rejects URL-only payloads without issuing a download request", async
 		});
 	}) as typeof fetch;
 	try {
-		await harness.command("image")?.("draw a cat --provider xai", ctx);
+		await harness.command("sn-image")?.("draw a cat --provider xai", ctx);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

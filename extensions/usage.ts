@@ -1,7 +1,25 @@
 // Usage runtime selectively adapted from @specode/pi-subscription-usage@1.0.2 (MIT).
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	getAgentDir,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+	CODEX_RESET_CONFIRMATION_OPTIONS,
+	codexResetCount,
+	consumeCodexResetCredit as defaultConsumeCodexResetCredit,
+	formatCodexResetOutcome,
+	isCodexResetConfirmed,
+	listCodexResetCredits as defaultListCodexResetCredits,
+	resetOptionExpiration,
+	resolveCodexResetAuth as defaultResolveCodexResetAuth,
+	type CodexResetOption,
+	type ResolvedCodexResetAuth,
+} from "../src/codex-reset.ts";
 import {
 	USAGE_CACHE_TTL_MS,
 	USAGE_FAILURE_BACKOFF_MS,
@@ -15,8 +33,10 @@ import {
 	resolveUsageAuth,
 	usageProviderForModel,
 	buildUsageStatusEvent,
+	type ResolvedUsageAuth,
 	type UsageDisplayMode,
 	type UsageModel,
+	type UsageReport,
 	type UsageState,
 } from "../src/usage.ts";
 
@@ -47,14 +67,40 @@ function errorMessage(error: unknown): string {
 	return redactUsageError(error instanceof Error ? error.message : String(error));
 }
 
-export default function usageExtension(pi: ExtensionAPI): void {
+export interface UsageExtensionDependencies {
+	queryUsage(auth: ResolvedUsageAuth, signal: AbortSignal): Promise<UsageReport>;
+	resolveCodexResetAuth(ctx: ExtensionContext): Promise<ResolvedCodexResetAuth>;
+	listCodexResetCredits(auth: ResolvedCodexResetAuth, signal: AbortSignal): Promise<{ availableCount: number; options: CodexResetOption[] }>;
+	consumeCodexResetCredit(
+		auth: ResolvedCodexResetAuth,
+		option: CodexResetOption,
+		requestId: string,
+		signal: AbortSignal,
+	): Promise<{ code: "reset" | "nothing_to_reset" | "no_credit" | "already_redeemed"; windowsReset: number }>;
+	createResetRequestId(): string;
+}
+
+const DEFAULT_DEPENDENCIES: UsageExtensionDependencies = {
+	queryUsage,
+	resolveCodexResetAuth: defaultResolveCodexResetAuth,
+	listCodexResetCredits: defaultListCodexResetCredits,
+	consumeCodexResetCredit: defaultConsumeCodexResetCredit,
+	createResetRequestId: randomUUID,
+};
+
+export default function usageExtension(
+	pi: ExtensionAPI,
+	dependencies: UsageExtensionDependencies = DEFAULT_DEPENDENCIES,
+): void {
 	const cache = new UsageCache();
 	const failures = new Map<string, { until: number; message: string }>();
 	const controllers = new Set<AbortController>();
 	let active = false;
 	let generation = 0;
+	let dataGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let statusController: AbortController | undefined;
+	let resetInProgress = false;
 	let config: UsageConfig = { displayMode: "remaining", refreshMs: USAGE_CACHE_TTL_MS };
 
 	const emitUnavailable = () => pi.events.emit(USAGE_STATUS_EVENT, { v: 1, status: "unavailable" });
@@ -92,6 +138,7 @@ export default function usageExtension(pi: ExtensionAPI): void {
 	};
 
 	async function loadState(ctx: ExtensionContext, model: UsageModel | undefined, force: boolean, signal: AbortSignal): Promise<UsageState> {
+		const expectedDataGeneration = dataGeneration;
 		const providerId = usageProviderForModel(model);
 		if (!providerId) return { status: "unsupported", providerId: model?.provider ?? "none", message: "Only OpenAI Codex and xAI/Grok are supported." };
 		try {
@@ -104,13 +151,15 @@ export default function usageExtension(pi: ExtensionAPI): void {
 			if (!force && failure && failure.until > Date.now()) return { status: "query-failed", providerId, message: failure.message };
 			failures.delete(key);
 			try {
-				const report = await queryUsage(auth, signal);
-				cache.set(providerId, auth.fingerprint, report);
+				const report = await dependencies.queryUsage(auth, signal);
+				if (dataGeneration === expectedDataGeneration) cache.set(providerId, auth.fingerprint, report);
 				return { status: "ready", report };
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") throw error;
 				const message = redactUsageError(errorMessage(error), auth.secrets);
-				failures.set(key, { until: Date.now() + USAGE_FAILURE_BACKOFF_MS, message });
+				if (dataGeneration === expectedDataGeneration) {
+					failures.set(key, { until: Date.now() + USAGE_FAILURE_BACKOFF_MS, message });
+				}
 				return { status: "query-failed", providerId, message };
 			}
 		} catch (error) {
@@ -146,10 +195,97 @@ export default function usageExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	pi.registerCommand("usage", {
+	async function redeemCodexReset(
+		ctx: ExtensionCommandContext,
+		model: UsageModel,
+		state: Extract<UsageState, { status: "ready" }>,
+		controller: AbortController,
+	): Promise<void> {
+		const summaryCount = codexResetCount(state.report);
+		if (model.provider !== "openai-codex" || summaryCount <= 0) return;
+		const expectedModel = `${model.provider}/${model.id}`;
+		if (`${ctx.model?.provider}/${ctx.model?.id}` !== expectedModel) {
+			throw new Error("Codex model changed; reset not redeemed.");
+		}
+
+		let auth = await dependencies.resolveCodexResetAuth(ctx);
+		const availability = await dependencies.listCodexResetCredits(auth, controller.signal);
+		if (availability.availableCount <= 0 || availability.options.length === 0) {
+			ctx.ui.notify("No verified Codex reset credits are available.", "info");
+			return;
+		}
+
+		const labels = availability.options.map((option: CodexResetOption, index: number) =>
+			`${index + 1}. ${option.title} · ${resetOptionExpiration(option)}`,
+		);
+		const selected = await ctx.ui.select("Choose a Codex reset", labels);
+		if (!selected) return;
+		const option = availability.options[labels.indexOf(selected)];
+		if (!option) return;
+		const confirmation = await ctx.ui.select(
+			`Redeem one Codex reset?\n${option.title}\n${option.description}\n${resetOptionExpiration(option)}`,
+			[...CODEX_RESET_CONFIRMATION_OPTIONS],
+		);
+		if (!isCodexResetConfirmed(confirmation)) return;
+
+		const expectedFingerprint = auth.fingerprint;
+		const requestId = dependencies.createResetRequestId();
+		while (!controller.signal.aborted) {
+			auth = await dependencies.resolveCodexResetAuth(ctx);
+			if (`${ctx.model?.provider}/${ctx.model?.id}` !== expectedModel || auth.fingerprint !== expectedFingerprint) {
+				throw new Error("Codex model or account changed; reset not redeemed.");
+			}
+			let outcome;
+			try {
+				outcome = await dependencies.consumeCodexResetCredit(auth, option, requestId, controller.signal);
+			} catch (error) {
+				if (error instanceof Error && error.name === "AbortError") throw error;
+				const retryAction = "Retry with same request ID";
+				const retry = await ctx.ui.select("Reset result uncertain", [retryAction, "Cancel"]);
+				if (retry !== retryAction) {
+					ctx.ui.notify(`Reset not confirmed: ${errorMessage(error)}`, "warning");
+					return;
+				}
+				continue;
+			}
+
+			dataGeneration += 1;
+			generation += 1;
+			const refreshGeneration = generation;
+			statusController?.abort();
+			clearTimer();
+			cache.clearProvider("openai-codex");
+			failures.clear();
+			let refreshed: UsageState | undefined;
+			try {
+				refreshed = await loadState(ctx, model, true, controller.signal);
+			} catch (error) {
+				ctx.ui.notify(formatCodexResetOutcome(outcome), "info");
+				if (!(error instanceof Error && error.name === "AbortError")) {
+					ctx.ui.notify(`Usage refresh failed after reset: ${errorMessage(error)}`, "warning");
+				}
+				return;
+			}
+			const unchanged = generation === refreshGeneration
+				&& `${ctx.model?.provider}/${ctx.model?.id}` === expectedModel
+				&& !controller.signal.aborted;
+			if (unchanged) publish(ctx, refreshed, model, active);
+			const remaining = unchanged && refreshed.status === "ready" ? codexResetCount(refreshed.report) : undefined;
+			ctx.ui.notify(formatCodexResetOutcome(outcome, remaining), "info");
+			if (unchanged && refreshed.status === "ready") {
+				ctx.ui.notify(formatUsageReport(refreshed, config.displayMode), "info");
+			} else if (!controller.signal.aborted && ctx.hasUI) {
+				ctx.ui.notify("Usage refresh was discarded because the selected model changed after reset.", "warning");
+				void refresh(ctx, ctx.model, false);
+			}
+			return;
+		}
+	}
+
+	pi.registerCommand("sn-usage", {
 		description: "Show subscription usage for the current OpenAI Codex or xAI/Grok provider",
 		handler: async (args, ctx) => {
-			if (args.trim()) { ctx.ui.notify("/usage takes no arguments.", "warning"); return; }
+			if (args.trim()) { ctx.ui.notify("/sn-usage takes no arguments.", "warning"); return; }
 			const controller = new AbortController();
 			controllers.add(controller);
 			const model = ctx.model;
@@ -165,6 +301,19 @@ export default function usageExtension(pi: ExtensionAPI): void {
 				}
 				ctx.ui.notify(formatUsageReport(state, config.displayMode), "info");
 				if (model) publish(ctx, state, model, active);
+				const resetCount = state.status === "ready" ? codexResetCount(state.report) : 0;
+				if (ctx.hasUI && model?.provider === "openai-codex" && state.status === "ready" && resetCount > 0) {
+					const action = await ctx.ui.select(`Reset credits: ${resetCount} available`, ["Redeem 1 Reset"]);
+					if (action) {
+						if (resetInProgress) {
+							ctx.ui.notify("A Codex reset redemption is already in progress.", "warning");
+						} else {
+							resetInProgress = true;
+							try { await redeemCodexReset(ctx, model, state, controller); }
+							finally { resetInProgress = false; }
+						}
+					}
+				}
 			} catch (error) {
 				if (!(error instanceof Error && error.name === "AbortError")) ctx.ui.notify(`Usage query failed: ${errorMessage(error)}`, "error");
 			} finally {
@@ -185,10 +334,12 @@ export default function usageExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (_event, ctx) => {
 		active = false;
 		generation += 1;
+		dataGeneration += 1;
 		clearTimer();
 		for (const controller of controllers) controller.abort();
 		controllers.clear();
 		statusController = undefined;
+		resetInProgress = false;
 		cache.clear();
 		failures.clear();
 		ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);

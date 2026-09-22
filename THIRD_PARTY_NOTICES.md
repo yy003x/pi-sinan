@@ -8,8 +8,8 @@ the projects below. No listed project is bundled as a runtime dependency.
 - Copyright (c) 2026 specode
 - <https://github.com/specode/pi-subscription-usage>
 - Adapted areas: usage runtime lifecycle, automatic refresh, cache/failure
-  backoff, status publishing, unified quota formatting, and provider query
-  structure. Only OpenAI Codex and xAI/Grok read-only usage paths were retained.
+  backoff, status publishing, unified quota formatting, provider query
+  structure, and the guarded OpenAI Codex reset-credit redemption flow.
 
 ## @narumitw/pi-usage 0.53.0
 

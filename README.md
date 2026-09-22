@@ -19,18 +19,21 @@ Pi loads each file below as an independent extension:
 
 ```text
 extensions/
-  image.ts            # /image and generate_image
+  image.ts            # /sn-image and generate_image
   search.ts           # /sn-search
-  usage.ts            # /usage, cache, refresh, status and events
+  usage.ts            # /sn-usage, quota refresh, and Codex reset redemption
+  fast.ts             # /sn-fast OpenAI Codex Fast request toggle
   footer.ts           # package-local two/three-line TUI footer
-  codex-recovery.ts   # /codex-recovery and OpenAI transport recovery
+  codex-recovery.ts   # /sn-recovery and OpenAI transport recovery
 ```
 
 | Capability | xAI/Grok subscription | OpenAI/Codex subscription |
 | --- | --- | --- |
 | Image generation | Yes | Yes |
 | Hosted web search | Yes (default) | Yes (explicit only) |
-| Read-only quota usage | Yes | Yes |
+| Quota usage | Yes | Yes |
+| Codex reset-credit redemption | No | Yes |
+| Fast request toggle | No | Yes |
 | Inline footer quota | Yes | Yes |
 | Transport/capacity recovery | No | Yes |
 
@@ -41,7 +44,7 @@ Resources can be selected without splitting the package, for example:
   "packages": [
     {
       "source": "git:github.com/yy003x/pi-sinan",
-      "extensions": ["image", "search", "usage", "footer", "codex-recovery"]
+      "extensions": ["image", "search", "usage", "fast", "footer", "codex-recovery"]
     }
   ]
 }
@@ -52,7 +55,7 @@ Resources can be selected without splitting the package, for example:
 ### Image
 
 - Tool: `generate_image`
-- Command: `/image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai]`
+- Command: `/sn-image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai]`
 
 `auto` tries xAI first and OpenAI second only when xAI is unavailable or its
 generation request fails. An explicit provider never crosses to the other
@@ -65,11 +68,11 @@ official ChatGPT Codex image endpoint with `gpt-image-2`. xAI uses
 `grok-imagine-image-2.0` by default.
 
 ```text
-/image a watercolor observatory at dusk
-/image a wide product sketch --aspect 16:9 --provider openai
-/image config on
-/image config off
-/image config dir .pi-images
+/sn-image a watercolor observatory at dusk
+/sn-image a wide product sketch --aspect 16:9 --provider openai
+/sn-image config on
+/sn-image config off
+/sn-image config dir .pi-images
 ```
 
 ### Search
@@ -88,15 +91,29 @@ Both paths require cited HTTP(S) sources; failures never cross providers.
 
 ### Usage
 
-- Command: `/usage`
+- Command: `/sn-usage`
 
 Usage follows the provider of the current model and supports only
-`openai-codex` and `xai`. It performs read-only official quota requests,
-refreshes automatically after model/session activity, caches successful
-reports for five minutes, and backs off failures for 30 seconds. It publishes
-plain `setStatus("pi-sinan-usage", ...)` text and structured
-`pi-sinan/usage-status/v1` events. No Codex credit redemption or other quota
-write operation exists.
+`openai-codex` and `xai`. It refreshes automatically after model/session
+activity, caches successful reports for five minutes, and backs off failures
+for 30 seconds. It publishes plain `setStatus("pi-sinan-usage", ...)` text and
+structured `pi-sinan/usage-status/v1` events.
+
+When Codex reports available reset credits, `/sn-usage` offers an explicit
+redemption flow. It revalidates the current Pi OAuth account, requires credit
+selection plus an irreversible confirmation, reuses one request ID for any
+user-approved retry, and refreshes quota after a confirmed result. This is the
+only quota write operation; xAI usage remains read-only.
+
+### Fast requests
+
+- Command: `/sn-fast [on|off|status]`
+
+Fast mode is off by default. Enabling it while an `openai-codex` model is
+selected injects `service_tier: "priority"` into subsequent Codex request
+payloads. The setting is stored in the current Pi session, survives
+reload/resume, and never changes xAI or other providers. Fast availability and
+its higher subscription-credit consumption remain account/model dependent.
 
 ### Footer
 
@@ -108,8 +125,8 @@ usage package.
 
 ### Codex recovery
 
-- Command: `/codex-recovery`
-- Command: `/codex-recovery reset`
+- Command: `/sn-recovery`
+- Command: `/sn-recovery reset`
 
 For OpenAI Codex only, automatic transport mode prefers Pi's normal WebSocket
 path, uses SSE during a two-minute cooldown after a transport failure, and
@@ -152,12 +169,16 @@ settings may also be overridden in a trusted project's `.pi/settings.json`:
 - Credentials are resolved at request time through Pi's model registry. They
   are not written to settings, session entries, status/events, errors, or
   usage caches.
-- Usage, OpenAI image, and hosted search credentials fail closed to their
-  official HTTPS endpoints. Redirects are rejected for all authenticated
-  requests.
+- Usage, reset redemption, OpenAI image, and hosted search credentials fail
+  closed to their official HTTPS endpoints. Redirects are rejected for all
+  authenticated requests.
+- Reset redemption additionally requires the active runtime token to exactly
+  match Pi's stored OAuth account and always defaults the irreversible
+  confirmation to cancellation.
 - Image generation accepts only the requested inline `b64_json` payload;
   provider-returned URLs are never fetched.
-- Validation tests use mocked requests and do not consume subscription quota.
+- Validation tests use mocked requests and do not consume subscription quota
+  or reset credits.
 - Account entitlement and provider-side rollout remain account-dependent; no
   live request is made during installation or tests.
 

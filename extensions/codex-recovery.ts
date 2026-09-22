@@ -42,7 +42,7 @@ export default function (pi: ExtensionAPI) {
 		recovery = undefined;
 	});
 
-	pi.registerCommand("codex-recovery", {
+	pi.registerCommand("sn-recovery", {
 		description: "Show or reset adaptive OpenAI Codex WebSocket/SSE recovery state",
 		handler: async (args, ctx) => {
 			const sessionId = ctx.sessionManager.getSessionId();

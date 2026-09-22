@@ -35,6 +35,7 @@ export interface UsageReport {
 	source: "codex-pi-oauth" | "grok-pi-oauth";
 	buckets: UsageBucket[];
 	defaultGroupId?: string;
+	resetCreditsAvailable?: number;
 }
 
 export type UsageState =
@@ -43,7 +44,7 @@ export type UsageState =
 
 export interface ResolvedUsageAuth {
 	providerId: UsageProviderId;
-	headers: { Authorization: string };
+	headers: Record<string, string> & { Authorization: string };
 	fingerprint: string;
 	secrets: string[];
 }
@@ -107,6 +108,9 @@ export class UsageCache {
 		}
 		this.entries.set(key, { createdAt: now, report });
 	}
+	clearProvider(providerId: UsageProviderId): void {
+		for (const key of this.entries.keys()) if (key.startsWith(`${providerId}:`)) this.entries.delete(key);
+	}
 	clear(): void { this.entries.clear(); }
 	private sweep(now: number): void {
 		for (const [key, entry] of this.entries) if (now - entry.createdAt >= this.ttlMs) this.entries.delete(key);
@@ -139,6 +143,10 @@ function object(value: unknown): Record<string, unknown> | undefined {
 function number(value: unknown): number | undefined {
 	const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
 	return Number.isFinite(parsed) ? parsed : undefined;
+}
+function nonnegativeInteger(value: unknown): number | undefined {
+	const parsed = number(value);
+	return parsed !== undefined && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 function timestamp(value: unknown): number | undefined {
 	if (typeof value !== "string" || value.length > 64) return undefined;
@@ -200,7 +208,16 @@ export function normalizeCodexUsage(payload: unknown, capturedAt = Date.now()): 
 		try { codexGroup(buckets, id, label, entry.rate_limit, true); } catch { /* Optional groups must not hide shared quota. */ }
 	}
 	if (buckets.length === 0) throw new Error("Codex usage endpoint returned no quota windows.");
-	return { providerId: "openai-codex", providerName: "OpenAI Codex", capturedAt, source: "codex-pi-oauth", buckets, defaultGroupId: CODEX_DEFAULT_GROUP_ID };
+	const resetCreditsAvailable = nonnegativeInteger(object(root.rate_limit_reset_credits)?.available_count);
+	return {
+		providerId: "openai-codex",
+		providerName: "OpenAI Codex",
+		capturedAt,
+		source: "codex-pi-oauth",
+		buckets,
+		defaultGroupId: CODEX_DEFAULT_GROUP_ID,
+		...(resetCreditsAvailable === undefined ? {} : { resetCreditsAvailable }),
+	};
 }
 
 function boundedCents(value: unknown): number | undefined {
@@ -418,6 +435,9 @@ export function formatUsageReport(state: UsageState, mode: UsageDisplayMode): st
 		const value = mode === "used" ? bucket.used : bucket.remaining;
 		const reset = bucket.resetsAt ? ` · resets ${new Date(bucket.resetsAt * 1000).toLocaleString()}` : "";
 		lines.push(`${grouped ? "    " : "  "}${bucket.label}: ${Math.round(value)}% ${qualifier}${reset}`);
+	}
+	if (state.report.resetCreditsAvailable !== undefined) {
+		lines.push(`  Resets left: ${state.report.resetCreditsAvailable}`);
 	}
 	return lines.join("\n");
 }
