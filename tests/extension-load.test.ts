@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import codexRecoveryExtension from "../extensions/codex-recovery.ts";
 import fastExtension from "../extensions/fast.ts";
-import footerExtension from "../extensions/footer.ts";
+import doctorExtension from "../extensions/doctor.ts";
 import imageExtension from "../extensions/image.ts";
 import searchExtension from "../extensions/search.ts";
 import usageExtension from "../extensions/usage.ts";
@@ -40,10 +40,10 @@ function registry() {
 
 test("all six extensions load and register unique public commands/tools", () => {
 	const loaded = registry();
-	for (const extension of [imageExtension, searchExtension, usageExtension, footerExtension, codexRecoveryExtension, fastExtension]) {
+	for (const extension of [imageExtension, searchExtension, usageExtension, doctorExtension, codexRecoveryExtension, fastExtension]) {
 		extension(loaded.api);
 	}
-	assert.deepEqual([...loaded.commands.keys()].sort(), ["sn-fast", "sn-image", "sn-recovery", "sn-search", "sn-usage"]);
+	assert.deepEqual([...loaded.commands.keys()].sort(), ["sn-doctor", "sn-fast", "sn-image", "sn-recovery", "sn-search", "sn-usage"]);
 	assert.deepEqual([...loaded.tools].sort(), ["generate_image"]);
 	assert.ok(loaded.handlers.some(({ event }) => event === "session_start"));
 });
@@ -149,9 +149,8 @@ test("image redacts response read exceptions before command UI", async () => {
 	(ctx as unknown as { ui: typeof harness.ui }).ui = harness.ui;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = (async () => ({
-		text: async () => {
-			throw new Error("read exposed oauth-image-secret and account-image-secret");
-		},
+		ok: true,
+		body: new ReadableStream({ pull() { throw new Error("read exposed oauth-image-secret and account-image-secret"); } }),
 	}) as unknown as Response) as typeof fetch;
 	try {
 		await harness.command("sn-image")?.("draw a cat --provider xai", ctx);

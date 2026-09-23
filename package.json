@@ -1,7 +1,7 @@
 {
   "name": "pi-sinan",
   "version": "0.2.0",
-  "description": "Pi extensions for xAI/Grok and OpenAI/Codex subscription image, search, usage, footer, and transport recovery workflows.",
+  "description": "Pi extensions for xAI/Grok and OpenAI/Codex subscription image, search, usage, diagnostics, and transport recovery workflows.",
   "type": "module",
   "keywords": [
     "pi-package",

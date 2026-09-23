@@ -26,6 +26,7 @@ import {
 	USAGE_STATUS_EVENT,
 	USAGE_STATUS_KEY,
 	UsageCache,
+	UsageAlerts,
 	formatUsageReport,
 	formatUsageStatus,
 	queryUsage,
@@ -43,6 +44,8 @@ import {
 interface UsageConfig {
 	displayMode: UsageDisplayMode;
 	refreshMs: number;
+	alerts: boolean;
+	thresholds: number[];
 }
 
 function configFrom(path: string): Partial<UsageConfig> {
@@ -50,7 +53,10 @@ function configFrom(path: string): Partial<UsageConfig> {
 		const root = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 		const sinan = root.piSinan && typeof root.piSinan === "object" && !Array.isArray(root.piSinan) ? root.piSinan as Record<string, unknown> : undefined;
 		const usage = sinan?.usage && typeof sinan.usage === "object" && !Array.isArray(sinan.usage) ? sinan.usage as Record<string, unknown> : undefined;
+		const thresholds = usage?.alertThresholds;
 		return {
+			...(typeof usage?.alerts === "boolean" ? { alerts: usage.alerts } : {}),
+			...(Array.isArray(thresholds) && thresholds.length > 0 && thresholds.every((value) => typeof value === "number" && value > 0 && value < 100) ? { thresholds: [...new Set(thresholds as number[])].sort((a, b) => b - a) } : {}),
 			...(usage?.displayMode === "used" || usage?.displayMode === "remaining" ? { displayMode: usage.displayMode } : {}),
 			...(typeof usage?.refreshMs === "number" && Number.isFinite(usage.refreshMs) && usage.refreshMs >= 30_000 ? { refreshMs: usage.refreshMs } : {}),
 		};
@@ -60,7 +66,7 @@ function configFrom(path: string): Partial<UsageConfig> {
 function readConfig(ctx: ExtensionContext): UsageConfig {
 	const global = configFrom(join(getAgentDir(), "settings.json"));
 	const project = ctx.isProjectTrusted() ? configFrom(join(ctx.cwd, ".pi", "settings.json")) : {};
-	return { displayMode: project.displayMode ?? global.displayMode ?? "remaining", refreshMs: project.refreshMs ?? global.refreshMs ?? USAGE_CACHE_TTL_MS };
+	return { displayMode: project.displayMode ?? global.displayMode ?? "remaining", refreshMs: project.refreshMs ?? global.refreshMs ?? USAGE_CACHE_TTL_MS, alerts: project.alerts ?? global.alerts ?? true, thresholds: project.thresholds ?? global.thresholds ?? [20, 10, 5] };
 }
 
 function errorMessage(error: unknown): string {
@@ -93,6 +99,7 @@ export default function usageExtension(
 	dependencies: UsageExtensionDependencies = DEFAULT_DEPENDENCIES,
 ): void {
 	const cache = new UsageCache();
+	const alerts = new UsageAlerts();
 	const failures = new Map<string, { until: number; message: string }>();
 	const controllers = new Set<AbortController>();
 	let active = false;
@@ -101,7 +108,7 @@ export default function usageExtension(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let statusController: AbortController | undefined;
 	let resetInProgress = false;
-	let config: UsageConfig = { displayMode: "remaining", refreshMs: USAGE_CACHE_TTL_MS };
+	let config: UsageConfig = { displayMode: "remaining", refreshMs: USAGE_CACHE_TTL_MS, alerts: true, thresholds: [20, 10, 5] };
 
 	const emitUnavailable = () => pi.events.emit(USAGE_STATUS_EVENT, { v: 1, status: "unavailable" });
 	const clearTimer = () => { if (timer) clearTimeout(timer); timer = undefined; };
@@ -139,6 +146,7 @@ export default function usageExtension(
 
 	async function loadState(ctx: ExtensionContext, model: UsageModel | undefined, force: boolean, signal: AbortSignal): Promise<UsageState> {
 		const expectedDataGeneration = dataGeneration;
+		const expectedGeneration = generation;
 		const providerId = usageProviderForModel(model);
 		if (!providerId) return { status: "unsupported", providerId: model?.provider ?? "none", message: "Only OpenAI Codex and xAI/Grok are supported." };
 		try {
@@ -152,7 +160,13 @@ export default function usageExtension(
 			failures.delete(key);
 			try {
 				const report = await dependencies.queryUsage(auth, signal);
-				if (dataGeneration === expectedDataGeneration) cache.set(providerId, auth.fingerprint, report);
+				if (dataGeneration === expectedDataGeneration && !signal.aborted) {
+					cache.set(providerId, auth.fingerprint, report);
+					if (generation === expectedGeneration) {
+						const warnings = alerts.check(`${providerId}:${auth.fingerprint}`, report, config.thresholds);
+						if (config.alerts && ctx.hasUI) for (const warning of warnings) ctx.ui.notify(warning, "warning");
+					}
+				}
 				return { status: "ready", report };
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") throw error;
@@ -283,9 +297,36 @@ export default function usageExtension(
 	}
 
 	pi.registerCommand("sn-usage", {
-		description: "Show subscription usage for the current OpenAI Codex or xAI/Grok provider",
+		description: "Show current/all OAuth subscription usage or toggle threshold alerts",
 		handler: async (args, ctx) => {
-			if (args.trim()) { ctx.ui.notify("/sn-usage takes no arguments.", "warning"); return; }
+			const action = args.trim().toLowerCase();
+			if (action === "alerts on" || action === "alerts off") {
+				config.alerts = action === "alerts on";
+				ctx.ui.notify(`Usage threshold alerts ${config.alerts ? "on" : "off"} for this session.`, "info");
+				return;
+			}
+			if (action === "all") {
+				const controller = new AbortController();
+				controllers.add(controller);
+				try {
+					const results: string[] = [];
+					for (const providerId of ["xai", "openai-codex"] as const) {
+						const models = ctx.modelRegistry.getAll().filter((candidate) => candidate.provider === providerId);
+						let model: UsageModel | undefined;
+						for (const candidate of models) {
+							try {
+								if (await resolveUsageAuth(ctx, providerId, undefined, candidate)) { model = candidate; break; }
+							} catch { /* Skip ineligible or failed OAuth credentials. */ }
+						}
+						if (!model) continue;
+						results.push(formatUsageReport(await loadState(ctx, model, true, controller.signal), config.displayMode));
+					}
+					ctx.ui.notify(results.join("\n\n") || "No eligible signed-in xAI or OpenAI Codex OAuth model is available.", "info");
+				} catch { ctx.ui.notify("Usage catalog could not be inspected safely.", "warning"); }
+				finally { controller.abort(); controllers.delete(controller); }
+				return;
+			}
+			if (action) { ctx.ui.notify("Usage: /sn-usage [all|alerts on|alerts off]", "warning"); return; }
 			const controller = new AbortController();
 			controllers.add(controller);
 			const model = ctx.model;
@@ -341,6 +382,7 @@ export default function usageExtension(
 		statusController = undefined;
 		resetInProgress = false;
 		cache.clear();
+		alerts.clear();
 		failures.clear();
 		ctx.ui.setStatus(USAGE_STATUS_KEY, undefined);
 		emitUnavailable();

@@ -275,7 +275,13 @@ export function usageProviderForModel(model: UsageModel | undefined): UsageProvi
 
 function officialOrigin(value: string | undefined, providerId: UsageProviderId): boolean {
 	if (!value) return false;
-	try { return PROVIDER_INFO[providerId].origins.includes(new URL(value).origin as never); } catch { return false; }
+	try {
+		const url = new URL(value);
+		const path = url.pathname.replace(/\/+$/, "");
+		return url.protocol === "https:" && !url.username && !url.password && !url.port && !url.search && !url.hash
+			&& PROVIDER_INFO[providerId].origins.includes(url.origin as never)
+			&& (providerId === "openai-codex" ? ["/backend-api", "/backend-api/codex"].includes(path) : path === "/v1");
+	} catch { return false; }
 }
 function headerValue(headers: Record<string, string | null> | undefined, name: string): string | undefined {
 	return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1] ?? undefined;
@@ -421,6 +427,29 @@ export function formatUsageStatus(report: UsageReport, mode: UsageDisplayMode, m
 	return event.windows.map((window) => `${window.label} ${Math.round(window.displayPercent)}%`).join(" · ");
 }
 
+export function relativeResetTime(seconds: number, now = Date.now()): string {
+	const minutes = Math.max(0, Math.ceil((seconds * 1000 - now) / 60_000));
+	return minutes >= 1440 ? `in ${Math.ceil(minutes / 1440)}d` : minutes >= 60 ? `in ${Math.ceil(minutes / 60)}h` : `in ${minutes}m`;
+}
+
+export class UsageAlerts {
+	private readonly previous = new Map<string, Map<string, { remaining: number; reset?: number }>>();
+	check(key: string, report: UsageReport, thresholds: readonly number[]): string[] {
+		const last = this.previous.get(key) ?? new Map<string, { remaining: number; reset?: number }>();
+		const next = new Map<string, { remaining: number; reset?: number }>();
+		const messages: string[] = [];
+		for (const bucket of report.buckets) {
+			const prior = last.get(bucket.id);
+			const crossed = thresholds.filter((threshold) => prior && prior.remaining > threshold && bucket.remaining <= threshold && prior.reset === bucket.resetsAt);
+			if (crossed.length) messages.push(`${report.providerName} ${bucket.label}: ${Math.round(bucket.remaining)}% left (crossed ${Math.max(...crossed)}%${bucket.resetsAt ? `, resets ${relativeResetTime(bucket.resetsAt)}` : ""}).`);
+			next.set(bucket.id, { remaining: bucket.remaining, reset: bucket.resetsAt });
+		}
+		this.previous.set(key, next);
+		return messages;
+	}
+	clear(): void { this.previous.clear(); }
+}
+
 export function formatUsageReport(state: UsageState, mode: UsageDisplayMode): string {
 	if (state.status !== "ready") return `${state.providerId}\n  ${state.status}: ${sanitizeUsageText(state.message)}`;
 	const qualifier = mode === "used" ? "used" : "left";
@@ -433,7 +462,7 @@ export function formatUsageReport(state: UsageState, mode: UsageDisplayMode): st
 			previousGroup = bucket.groupId;
 		}
 		const value = mode === "used" ? bucket.used : bucket.remaining;
-		const reset = bucket.resetsAt ? ` · resets ${new Date(bucket.resetsAt * 1000).toLocaleString()}` : "";
+		const reset = bucket.resetsAt ? ` · resets ${new Date(bucket.resetsAt * 1000).toLocaleString()} (${relativeResetTime(bucket.resetsAt)})` : "";
 		lines.push(`${grouped ? "    " : "  "}${bucket.label}: ${Math.round(value)}% ${qualifier}${reset}`);
 	}
 	if (state.report.resetCreditsAvailable !== undefined) {

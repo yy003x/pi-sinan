@@ -3,10 +3,10 @@
  * Uses an existing xAI SuperGrok/X Premium or OpenAI ChatGPT/Codex subscription.
  * This file is one extension in a multi-extension package, not a standalone product.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, realpathSync, lstatSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, relative, sep } from "node:path";
 import { StringEnum, type Api, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, getImageDimensions } from "@earendil-works/pi-tui";
 import { createImageCardRenderer, normalizePng, type ImageCardData } from "../src/image-preview.ts";
+import { IMAGE_HISTORY_ENTRY, sessionImageHistory, type ImageHistoryItem } from "../src/image-history.ts";
 import {
 	OPENAI_CODEX_IMAGE_MODEL,
 	attemptImageProviders,
@@ -114,7 +115,7 @@ function workspaceDir(cwd: string, dir: string): string {
 function stamp(): string {
 	const d = new Date();
 	const p = (n: number) => String(n).padStart(2, "0");
-	return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+	return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${randomUUID()}`;
 }
 
 function outputPath(cwd: string, path?: string): string {
@@ -126,6 +127,20 @@ function outputPath(cwd: string, path?: string): string {
 		throw new Error("output path must stay inside the current workspace");
 	}
 	return resolved;
+}
+
+function assertWorkspaceOutputParent(cwd: string, target: string): void {
+	const root = realpathSync(cwd);
+	let parent = dirname(target);
+	while (!lstatSync(parent, { throwIfNoEntry: false })) {
+		const next = dirname(parent);
+		if (next === parent) throw new Error("Cannot find an existing output directory.");
+		parent = next;
+	}
+	const within = relative(root, realpathSync(parent));
+	if (within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) {
+		throw new Error("Output directory escapes the workspace.");
+	}
 }
 
 function errorMessage(parsed: Record<string, unknown>, fallback: string): string {
@@ -205,7 +220,24 @@ async function postJson(
 	}
 	let text: string;
 	try {
-		text = await response.text();
+		if (!response.body) throw new Error("empty image response");
+		const reader = response.body.getReader();
+		const chunks: Uint8Array[] = [];
+		let size = 0;
+		const max = response.ok ? 32 * 1024 * 1024 : 4096;
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				size += value.length;
+				if (size > max) { await reader.cancel(); throw new Error("image response exceeded size limit"); }
+				chunks.push(value);
+			}
+		} finally { reader.releaseLock(); }
+		const bytes = new Uint8Array(size);
+		let offset = 0;
+		for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+		text = new TextDecoder().decode(bytes);
 	} catch (error) {
 		if (isAbort(error, signal)) throw error;
 		throw new Error(`image response read failed: ${redactProviderError(thrownErrorMessage(error), auth)}`);
@@ -280,6 +312,8 @@ async function requestImage(
 }
 
 async function generate(input: ImageGenerationInput): Promise<GeneratedImage> {
+	if (lstatSync(input.path, { throwIfNoEntry: false })) throw new Error("Output image already exists; choose a new path before spending quota.");
+	assertWorkspaceOutputParent(input.ctx.cwd, input.path);
 	if (input.aspect && !ASPECTS.has(input.aspect)) {
 		throw new Error(`unsupported aspect_ratio: ${input.aspect}`);
 	}
@@ -293,8 +327,10 @@ async function generate(input: ImageGenerationInput): Promise<GeneratedImage> {
 	// Provider fallback ends once image bytes exist: normalization/write failures must not spend a second subscription.
 	bytes = await normalizePng(bytes);
 	await withFileMutationQueue(input.path, async () => {
+		assertWorkspaceOutputParent(input.ctx.cwd, input.path);
 		await mkdir(dirname(input.path), { recursive: true, mode: 0o700 });
-		await writeFile(input.path, bytes, { mode: 0o600 });
+		assertWorkspaceOutputParent(input.ctx.cwd, input.path);
+		await writeFile(input.path, bytes, { mode: 0o600, flag: "wx" });
 	});
 	return {
 		path: input.path,
@@ -346,6 +382,12 @@ async function cardData(result: GeneratedImage, preview: boolean): Promise<Image
 
 export default function (pi: ExtensionAPI) {
 	const cards = createImageCardRenderer(() => showInConversation());
+	const branchAnchor = (ctx: ExtensionContext) => ({ sessionFile: ctx.sessionManager?.getSessionFile?.(), leafId: ctx.sessionManager?.getLeafId?.() });
+	const remember = (ctx: ExtensionContext, prompt: string, aspect: string | undefined, result: GeneratedImage, anchor: ReturnType<typeof branchAnchor>) => {
+		if (anchor.sessionFile !== ctx.sessionManager?.getSessionFile?.() ||
+			(anchor.leafId && !ctx.sessionManager.getBranch().some((entry) => entry.id === anchor.leafId))) return;
+		pi.appendEntry(IMAGE_HISTORY_ENTRY, { id: randomUUID(), prompt, provider: result.provider, ...(aspect ? { aspect } : {}), path: result.path, workspace: resolve(ctx.cwd), createdAt: Date.now() } satisfies ImageHistoryItem);
+	};
 	pi.on("session_start", () => cards.reset());
 	pi.on("session_tree", () => cards.reset());
 	pi.on("session_shutdown", () => cards.reset());
@@ -373,6 +415,7 @@ export default function (pi: ExtensionAPI) {
 	}),
 	async execute(toolCallId, params, signal, onUpdate, ctx) {
 		const path = outputPath(ctx.cwd, params.path);
+		const anchor = branchAnchor(ctx);
 		onUpdate?.({ content: [{ type: "text", text: "Generating image…" }], details: undefined });
 		const result = await generate({
 			prompt: params.prompt,
@@ -384,6 +427,7 @@ export default function (pi: ExtensionAPI) {
 			ctx,
 			requestId: toolCallId,
 		});
+		remember(ctx, params.prompt, params.aspect_ratio, result, anchor);
 		const preview = showInConversation(params.show_in_conversation);
 		const summary = `Generated with ${result.provider}/${result.model}: ${result.path} (${result.bytes} bytes)`;
 		const details = await cardData(result, preview);
@@ -430,12 +474,48 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`showInConversation=${showInConversation()} outputDir=${currentDir}. /sn-image config on|off|dir <path>`, "info");
 				return;
 			}
+			if (trimmed === "history") {
+				const history = sessionImageHistory(ctx.sessionManager.getBranch(), ctx.cwd);
+				ctx.ui.notify(history.length ? history.map((item, index) => `${index + 1}. ${item.id} · ${item.provider} ${item.path} · ${new Date(item.createdAt).toLocaleString()}`).join("\n") : "No images in the current session branch.", "info");
+				return;
+			}
+			const historyCommand = /^(show|repeat)(?:\s+(\S+))?$/.exec(trimmed);
+			if (historyCommand) {
+				const history = sessionImageHistory(ctx.sessionManager.getBranch(), ctx.cwd);
+				const id = historyCommand[2];
+				const item = id ? /^\d+$/.test(id) ? history[Number(id) - 1] : history.find((entry) => entry.id === id) : history.at(-1);
+				if (!item) { ctx.ui.notify("No such image in the current session branch.", "warning"); return; }
+				try {
+					if (historyCommand[1] === "show") {
+						const actual = realpathSync(item.path);
+						const within = relative(realpathSync(ctx.cwd), actual);
+						if (!within || within.startsWith("..") || isAbsolute(within) || !lstatSync(item.path).isFile()) throw new Error("Session image path is no longer a regular workspace file.");
+						const size = statSync(item.path).size;
+						if (size <= 0 || size > 8 * 1024 * 1024) throw new Error("Session image exceeds the preview size limit.");
+						const bytes = readFileSync(item.path);
+						if (bytes.length > 8 * 1024 * 1024) throw new Error("Session image exceeds the preview size limit.");
+						const data = await cardData({ path: item.path, provider: item.provider, model: "saved image", bytes: bytes.length, dataBase64: bytes.toString("base64") }, true);
+						pi.appendEntry(ENTRY_TYPE, data);
+						ctx.ui.notify(`Showing ${item.path}`, "info");
+					} else {
+						const anchor = branchAnchor(ctx);
+						const result = await generate({ prompt: item.prompt, provider: item.provider, aspect: item.aspect, path: outputPath(ctx.cwd), ctx, requestId: randomUUID() });
+						remember(ctx, item.prompt, item.aspect, result, anchor);
+						const data = await cardData(result, showInConversation());
+						cards.markLive(data);
+						pi.appendEntry(ENTRY_TYPE, data);
+						ctx.ui.notify(`Repeated with ${item.provider}; subscription quota spent: ${result.path}`, "info");
+					}
+				} catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Image operation failed.", "error"); }
+				return;
+			}
 			const parsed = parseCommand(trimmed);
 			if (!parsed.prompt) {
 				ctx.ui.notify("Usage: /sn-image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]", "warning");
 				return;
 			}
 			try {
+				const anchor = branchAnchor(ctx);
 				const result = await generate({
 					prompt: parsed.prompt,
 					provider: parsed.provider,
@@ -444,6 +524,7 @@ export default function (pi: ExtensionAPI) {
 					ctx,
 					requestId: randomUUID(),
 				});
+				remember(ctx, parsed.prompt, parsed.aspect, result, anchor);
 				const preview = showInConversation(parsed.preview);
 				const data = await cardData(result, preview);
 				cards.markLive(data);
