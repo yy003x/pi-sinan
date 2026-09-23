@@ -82,12 +82,18 @@ function readImageSettings(): ImageAccessSettings {
 function showInConversation(override?: boolean): boolean {
 	if (typeof override === "boolean") return override;
 	const value = readImageSettings().showInConversation;
-	return value !== false;
+	return value === true;
 }
 
 function writeImageSettings(patch: ImageAccessSettings): void {
 	const path = join(getAgentDir(), "settings.json");
-	const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		raw = {};
+	}
 	const root = raw[SETTINGS_KEY] && typeof raw[SETTINGS_KEY] === "object" && !Array.isArray(raw[SETTINGS_KEY])
 		? { ...(raw[SETTINGS_KEY] as Record<string, unknown>) }
 		: {};
@@ -98,7 +104,7 @@ function writeImageSettings(patch: ImageAccessSettings): void {
 	if (patch.outputDir !== undefined) image.outputDir = patch.outputDir;
 	root.image = image;
 	raw[SETTINGS_KEY] = root;
-	writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+	writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
 }
 
 function workspaceDir(cwd: string, dir: string): string {
@@ -449,14 +455,15 @@ export default function (pi: ExtensionAPI) {
 		return cards.render(entry.data, expanded, theme);
 	});
 	pi.registerCommand("sn-image", {
-		description: "Generate an image: /sn-image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]. /sn-image config [on|off|dir <path>] configures preview and output directory.",
+		description: "Generate an image: /sn-image <prompt> [--path file.png] [--aspect 16:9] [--provider auto|xai|openai] [--preview|--no-preview]. /sn-image config toggles preview; config status|dir <path> inspects settings or changes the output directory.",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "config" || trimmed.startsWith("config ")) {
 				const rest = trimmed.slice("config".length).trim();
-				if (rest === "on" || rest === "off") {
-					writeImageSettings({ showInConversation: rest === "on" });
-					ctx.ui.notify(`piSinan.image.showInConversation = ${rest === "on"}`, "info");
+				if (!rest) {
+					const previous = showInConversation();
+					writeImageSettings({ showInConversation: !previous });
+					ctx.ui.notify(`Image preview: ${previous ? "on -> off" : "off -> on"}`, "info");
 					return;
 				}
 				if (rest.startsWith("dir ") || rest === "dir") {
@@ -470,8 +477,12 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`piSinan.image.outputDir = ${dir}`, "info");
 					return;
 				}
-				const currentDir = readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR;
-				ctx.ui.notify(`showInConversation=${showInConversation()} outputDir=${currentDir}. /sn-image config on|off|dir <path>`, "info");
+				if (rest === "status") {
+					const currentDir = readImageSettings().outputDir ?? DEFAULT_OUTPUT_DIR;
+					ctx.ui.notify(`Image preview: ${showInConversation() ? "on" : "off"}; outputDir=${currentDir}`, "info");
+					return;
+				}
+				ctx.ui.notify("Usage: /sn-image config [status|dir <path>]", "warning");
 				return;
 			}
 			if (trimmed === "history") {

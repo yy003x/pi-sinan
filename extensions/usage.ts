@@ -66,7 +66,7 @@ function configFrom(path: string): Partial<UsageConfig> {
 function readConfig(ctx: ExtensionContext): UsageConfig {
 	const global = configFrom(join(getAgentDir(), "settings.json"));
 	const project = ctx.isProjectTrusted() ? configFrom(join(ctx.cwd, ".pi", "settings.json")) : {};
-	return { displayMode: project.displayMode ?? global.displayMode ?? "remaining", refreshMs: project.refreshMs ?? global.refreshMs ?? USAGE_CACHE_TTL_MS, alerts: project.alerts ?? global.alerts ?? true, thresholds: project.thresholds ?? global.thresholds ?? [20, 10, 5] };
+	return { displayMode: project.displayMode ?? global.displayMode ?? "remaining", refreshMs: project.refreshMs ?? global.refreshMs ?? USAGE_CACHE_TTL_MS, alerts: project.alerts ?? global.alerts ?? false, thresholds: project.thresholds ?? global.thresholds ?? [20, 10, 5] };
 }
 
 function errorMessage(error: unknown): string {
@@ -108,7 +108,7 @@ export default function usageExtension(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let statusController: AbortController | undefined;
 	let resetInProgress = false;
-	let config: UsageConfig = { displayMode: "remaining", refreshMs: USAGE_CACHE_TTL_MS, alerts: true, thresholds: [20, 10, 5] };
+	let config: UsageConfig = { displayMode: "remaining", refreshMs: USAGE_CACHE_TTL_MS, alerts: false, thresholds: [20, 10, 5] };
 
 	const emitUnavailable = () => pi.events.emit(USAGE_STATUS_EVENT, { v: 1, status: "unavailable" });
 	const clearTimer = () => { if (timer) clearTimeout(timer); timer = undefined; };
@@ -300,9 +300,10 @@ export default function usageExtension(
 		description: "Show current/all OAuth subscription usage or toggle threshold alerts",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
-			if (action === "alerts on" || action === "alerts off") {
-				config.alerts = action === "alerts on";
-				ctx.ui.notify(`Usage threshold alerts ${config.alerts ? "on" : "off"} for this session.`, "info");
+			if (action === "alerts") {
+				const previous = config.alerts ? "on" : "off";
+				config.alerts = !config.alerts;
+				ctx.ui.notify(`Usage threshold alerts: ${previous} -> ${config.alerts ? "on" : "off"} for this session.`, "info");
 				return;
 			}
 			if (action === "all") {
@@ -326,7 +327,7 @@ export default function usageExtension(
 				finally { controller.abort(); controllers.delete(controller); }
 				return;
 			}
-			if (action) { ctx.ui.notify("Usage: /sn-usage [all|alerts on|alerts off]", "warning"); return; }
+			if (action) { ctx.ui.notify("Usage: /sn-usage [all|alerts]", "warning"); return; }
 			const controller = new AbortController();
 			controllers.add(controller);
 			const model = ctx.model;

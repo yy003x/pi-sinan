@@ -47,20 +47,21 @@ export default function fastExtension(pi: ExtensionAPI, check: typeof checkFastA
 	pi.on("model_select", (_event, ctx) => { void validate(ctx); });
 	pi.on("session_shutdown", (_event, ctx) => { generation++; ctx.ui.setStatus(FAST_STATUS_KEY, undefined); });
 	pi.registerCommand("sn-fast", {
-		description: "Toggle officially catalog-supported Codex Fast requests: /sn-fast on|off|status",
+		description: "Toggle officially catalog-supported Codex Fast requests: /sn-fast [status]",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
-			if (!["", "on", "off", "status"].includes(action)) { ctx.ui.notify("Usage: /sn-fast [on|off|status]", "warning"); return; }
+			if (action !== "" && action !== "status") { ctx.ui.notify("Usage: /sn-fast [status]", "warning"); return; }
 			if (action === "status") { await validate(ctx); ctx.ui.notify(`Fast ${enabled ? "on" : "off"}; ${availability.status}: ${availability.reason} Requesting priority never guarantees server routing.`, "info"); return; }
-			const next = action === "on" || (action === "" && !enabled);
+			const next = !enabled;
 			if (next) {
 				await validate(ctx);
 				if (availability.status !== "supported") { ctx.ui.notify(`Fast unavailable: ${availability.reason}`, "warning"); return; }
 			}
+			const previous = enabled ? "on" : "off";
 			enabled = next;
 			pi.appendEntry(FAST_STATE_ENTRY, { enabled });
 			publish(ctx);
-			ctx.ui.notify(`OpenAI Codex Fast request ${enabled ? "enabled" : "disabled"}; ${enabled ? "Fast may consume subscription credits faster; " : ""}server routing is not guaranteed.`, "info");
+			ctx.ui.notify(`OpenAI Codex Fast: ${previous} -> ${enabled ? "on" : "off"}; ${enabled ? "Fast may consume subscription credits faster; " : ""}server routing is not guaranteed.`, "info");
 		},
 	});
 }

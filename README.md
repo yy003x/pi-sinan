@@ -70,10 +70,16 @@ official ChatGPT Codex image endpoint with `gpt-image-2`. xAI uses
 ```text
 /sn-image a watercolor observatory at dusk
 /sn-image a wide product sketch --aspect 16:9 --provider openai
-/sn-image config on
-/sn-image config off
+/sn-image config
+/sn-image config status
 /sn-image config dir .pi-images
 ```
+
+Image previews are off by default unless explicitly configured. `/sn-image config`
+toggles the global preview setting and reports `off -> on` or `on -> off`;
+`config status` reads it without changing it. `--preview` and `--no-preview`
+still override a single generation. Existing explicit
+`piSinan.image.showInConversation` settings remain authoritative.
 
 `/sn-image history` lists images and IDs in the current session branch; `/sn-image show [index|id]`
 shows a saved image; `/sn-image repeat [index|id]` explicitly generates a new image
@@ -96,13 +102,14 @@ Both paths require cited HTTP(S) sources; failures never cross providers.
 
 ### Usage
 
-- Commands: `/sn-usage`, `/sn-usage all`, `/sn-usage alerts on|off`
+- Commands: `/sn-usage`, `/sn-usage all`, `/sn-usage alerts`
 
 Current usage follows the provider of the current model; `all` queries eligible
 signed-in OAuth models for both `openai-codex` and `xai` independently. Alerts
-(default on) report remaining quota crossing configurable 20/10/5 percent
-thresholds once per account fingerprint and quota window. Toggle for the
-current session only. Resets show relative time. The independent pi-utils
+(default off unless explicitly configured) report remaining quota crossing
+configurable 20/10/5 percent thresholds once per account fingerprint and quota
+window. `/sn-usage alerts` toggles them for the current session only and reports
+`off -> on` or `on -> off`. Resets show relative time. The independent pi-utils
 extension owns the sole TUI footer. Usage still publishes `pi-sinan-usage`
 status and `pi-sinan/usage-status/v1` events. It refreshes automatically after
 model/session activity, caches successful reports for five minutes, and backs
@@ -116,9 +123,10 @@ only quota write operation; xAI usage remains read-only.
 
 ### Fast requests
 
-- Command: `/sn-fast [on|off|status]`
+- Commands: `/sn-fast` (toggle), `/sn-fast status` (read-only)
 
-Fast mode is off by default. Enabling it requires the official Codex model
+Fast mode is off by default. Each `/sn-fast` toggles the request setting and
+reports `off -> on` or `on -> off`. Enabling it requires the official Codex model
 catalog GET to list the selected model slug with `service_tiers.id=priority`.
 Only supported Codex request payloads receive `service_tier: "priority"`.
 The catalog and OAuth are revalidated when the model changes and before an
@@ -161,12 +169,12 @@ settings may also be overridden in a trusted project's `.pi/settings.json`:
   "piSinan": {
     "image": {
       "outputDir": ".pi-images",
-      "showInConversation": true
+      "showInConversation": false
     },
     "usage": {
       "displayMode": "remaining",
       "refreshMs": 300000,
-      "alerts": true,
+      "alerts": false,
       "alertThresholds": [20, 10, 5]
     }
   }
@@ -174,7 +182,9 @@ settings may also be overridden in a trusted project's `.pi/settings.json`:
 ```
 
 `usage.displayMode` is `remaining` or `used`; `refreshMs` must be at least
-30 seconds. Generated paths must remain inside the current workspace.
+30 seconds. Generated paths must remain inside the current workspace. Values
+explicitly set to `true` in settings are still honored; changing the defaults
+does not rewrite existing settings.
 
 ## Authentication and safety boundaries
 

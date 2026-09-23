@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkFastAvailability } from "../src/fast-catalog.ts";
@@ -142,6 +142,70 @@ test("/sn-usage all resolves each provider independently even when current model
 	assert.deepEqual(queried, ["xai", "openai-codex"]);
 	assert.equal(messages.length, 1);
 	assert.doesNotMatch(messages.join("\n"), /secret/);
+});
+
+test("/sn-usage alerts toggles from off and preserves explicit settings", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-sinan-alert-toggle-"));
+	const agentDir = join(cwd, "agent");
+	mkdirSync(agentDir);
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	try {
+		let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
+		const notices: string[] = [];
+		const pi = { registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, on(name: string, handler: (event: unknown, ctx: ExtensionContext) => void) { handlers.set(name, handler); }, events: { emit() {} } } as unknown as ExtensionAPI;
+		const ctx = { cwd, hasUI: false, isProjectTrusted: () => false, ui: { notify: (text: string) => notices.push(text) } } as unknown as ExtensionContext;
+		usageExtension(pi);
+		handlers.get("session_start")?.({}, ctx);
+		await command?.("alerts", ctx);
+		assert.match(notices.at(-1) ?? "", /off -> on/);
+		await command?.("alerts", ctx);
+		assert.match(notices.at(-1) ?? "", /on -> off/);
+		await command?.("alerts on", ctx);
+		assert.match(notices.at(-1) ?? "", /Usage: \/sn-usage \[all\|alerts\]/);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ piSinan: { usage: { alerts: true } } }));
+		handlers.get("session_start")?.({}, ctx);
+		await command?.("alerts", ctx);
+		assert.match(notices.at(-1) ?? "", /on -> off/, "explicit true settings must remain authoritative");
+	} finally {
+		if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("/sn-image config toggles previews from off without a settings file", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-sinan-preview-toggle-"));
+	const agentDir = join(cwd, "agent");
+	mkdirSync(agentDir);
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	try {
+		let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+		const notices: string[] = [];
+		const entries: Array<{ type: string; customType: string; data: unknown }> = [];
+		const pi = { on() {}, registerEntryRenderer() {}, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, appendEntry(customType: string, data: unknown) { entries.push({ type: "custom", customType, data }); } } as unknown as ExtensionAPI;
+		const ctx = { cwd, ui: { notify: (text: string) => notices.push(text) }, sessionManager: { getBranch: () => entries } } as unknown as ExtensionContext;
+		imageExtension(pi);
+		await command?.("config status", ctx);
+		assert.match(notices.at(-1) ?? "", /Image preview: off/);
+		assert.equal(existsSync(join(agentDir, "settings.json")), false, "status must not write settings");
+		await command?.("config", ctx);
+		assert.match(notices.at(-1) ?? "", /off -> on/);
+		assert.equal(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")).piSinan.image.showInConversation, true);
+		await command?.("config dir pictures", ctx);
+		await command?.("config", ctx);
+		assert.match(notices.at(-1) ?? "", /on -> off/);
+		assert.deepEqual(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")).piSinan.image, { showInConversation: false, outputDir: "pictures" });
+		await command?.("config on", ctx);
+		assert.match(notices.at(-1) ?? "", /Usage: \/sn-image config/);
+		assert.equal(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")).piSinan.image.showInConversation, false);
+	} finally {
+		if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+		rmSync(cwd, { recursive: true, force: true });
+	}
 });
 
 test("doctor recovery display never includes raw failure diagnostics", () => {

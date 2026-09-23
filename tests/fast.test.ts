@@ -42,7 +42,8 @@ test("/sn-fast gates on metadata, rechecks request, preserves session toggle and
 	} as unknown as ExtensionAPI;
 	fastExtension(pi, async () => ({ status: available ? "supported" : "unavailable", reason: "test", ...(available ? { fingerprint: "account-fingerprint" } : {}) }));
 	handlers.get("session_start")?.({}, ctx);
-	await command?.("on", ctx);
+	await command?.("", ctx);
+	assert.match(notices.at(-1) ?? "", /off -> on/);
 	assert.deepEqual(await handlers.get("before_provider_request")?.({ payload: { model: "m" } }, ctx), { model: "m", service_tier: "priority" });
 	assert.deepEqual(await handlers.get("before_provider_request")?.({ payload: { model: "other" } }, ctx), { model: "other" });
 	available = false;
@@ -50,6 +51,13 @@ test("/sn-fast gates on metadata, rechecks request, preserves session toggle and
 	await command?.("status", ctx);
 	assert.match(notices.join("\n"), /unavailable/);
 	assert.ok(events.some((entry) => (entry as { requestingPriority?: boolean }).requestingPriority));
-	await command?.("off", ctx);
+	await command?.("", ctx);
+	assert.match(notices.at(-1) ?? "", /on -> off/);
 	assert.deepEqual(entries, [{ type: "custom", customType: FAST_STATE_ENTRY, data: { enabled: true } }, { type: "custom", customType: FAST_STATE_ENTRY, data: { enabled: false } }]);
+	await command?.("on", ctx);
+	assert.match(notices.at(-1) ?? "", /Usage: \/sn-fast \[status\]/);
+	assert.equal(entries.length, 2, "obsolete on/off arguments must not change the state");
+	await command?.("", ctx);
+	assert.match(notices.at(-1) ?? "", /Fast unavailable/);
+	assert.equal(entries.length, 2, "unsupported models must not turn Fast on");
 });
