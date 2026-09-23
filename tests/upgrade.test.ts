@@ -18,7 +18,7 @@ const report = (remaining: number, reset = 100): UsageReport => ({ providerId: "
 test("catalog GET uses official origin and OAuth, bounds responses, rejects redirects and hides secrets", async () => {
 	const ctx = { model: codex, modelRegistry: { isUsingOAuth: () => true, getProviderAuth: async () => ({ auth: { apiKey: "secret" } }) } } as unknown as ExtensionContext;
 	const result = await checkFastAvailability(ctx, (async (input, init) => {
-		assert.match(String(input), /^https:\/\/chatgpt\.com\/backend-api\/codex\/models\?client_version=/);
+		assert.equal(String(input), "https://chatgpt.com/backend-api/codex/models?client_version=0.156.0");
 		assert.equal(init?.method, "GET");
 		assert.equal(init?.redirect, "error");
 		assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer secret");
@@ -27,8 +27,21 @@ test("catalog GET uses official origin and OAuth, bounds responses, rejects redi
 	assert.equal(result.status, "supported");
 	const bad = await checkFastAvailability({ ...ctx, model: { ...codex, baseUrl: "https://proxy.example/backend-api" } } as ExtensionContext, async () => { throw new Error("fetch must not run"); });
 	assert.equal(bad.status, "unavailable");
-	const oversize = await checkFastAvailability(ctx, async () => new Response("x".repeat(260_000)));
+	const currentSize = await checkFastAvailability(ctx, async () => new Response(JSON.stringify({ models: [
+		{ slug: "m", service_tiers: [{ id: "priority" }] },
+		{ slug: "other", description: "x".repeat(600 * 1024) },
+	] })));
+	assert.equal(currentSize.status, "supported", "a catalog larger than the old 256 KiB cap must remain usable");
+	let cancelled = false;
+	const oversize = await checkFastAvailability(ctx, async () => new Response(new ReadableStream<Uint8Array>({
+		start(controller) { controller.enqueue(new Uint8Array(1024 * 1024 + 1)); },
+		cancel() { cancelled = true; },
+	})));
 	assert.equal(oversize.status, "unavailable");
+	assert.equal(oversize.reason, "Official catalog response too large.");
+	assert.equal(cancelled, true, "oversized catalog streams must be cancelled before parsing");
+	const empty = await checkFastAvailability(ctx, async () => new Response(JSON.stringify({ models: [] })));
+	assert.equal(empty.status, "unavailable", "an empty official catalog must never enable Fast");
 	const conflictingHeaders = { ...ctx, modelRegistry: { ...ctx.modelRegistry, getProviderAuth: async () => ({ auth: { apiKey: "secret", headers: { authorization: "Bearer wrong" } } }) } } as unknown as ExtensionContext;
 	const singleAuth = await checkFastAvailability(conflictingHeaders, async (_url, init) => {
 		const headers = new Headers(init?.headers);

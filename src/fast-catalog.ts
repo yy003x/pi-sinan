@@ -2,8 +2,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { fingerprintUsageAuth } from "./usage.ts";
 
 const CATALOG_URL = "https://chatgpt.com/backend-api/codex/models";
-const MAX_BYTES = 256 * 1024;
-const CLIENT_VERSION = "0.86.0";
+// Keep the catalog bounded while allowing the current official Codex response (~522 KB).
+const MAX_BYTES = 1024 * 1024;
+// This is the Codex catalog client version, not the Pi package version.
+const CLIENT_VERSION = "0.156.0";
 const CATALOG_CACHE_TTL_MS = 60_000;
 const catalogCache = new Map<string, { until: number; result: FastAvailability }>();
 export type FastAvailability = { status: "supported" | "unsupported" | "unavailable"; reason: string; fingerprint?: string };

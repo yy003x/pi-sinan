@@ -129,9 +129,11 @@ Fast mode is off by default. Each `/sn-fast` toggles the request setting and
 reports `off -> on` or `on -> off`. Enabling it requires the official Codex model
 catalog GET to list the selected model slug with `service_tiers.id=priority`.
 Only supported Codex request payloads receive `service_tier: "priority"`.
-The catalog and OAuth are revalidated when the model changes and before an
-enabled provider request; unavailable metadata fails closed. This requests a
-tier but cannot prove the server honored it. `pi-sinan/fast-status/v1` emits
+The catalog request uses the verified Codex CLI version `0.156.0` (independent of
+Pi's version); the extension bounds its response to 1 MiB, not an official
+service limit. The catalog and OAuth are revalidated when the model changes
+and before an enabled provider request; unavailable metadata fails closed.
+This requests a tier but cannot prove the server honored it. `pi-sinan/fast-status/v1` emits
 structured local status. The setting is stored in the current Pi session, survives
 reload/resume, and never changes xAI or other providers. Fast availability and
 its higher subscription-credit consumption remain account/model dependent.
