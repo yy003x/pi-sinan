@@ -550,24 +550,103 @@ test("SSE fetch failures expose errno codes without persisting nested sensitive 
 			baseProvider: base,
 		},
 	);
-	const result = await complete(recovery.provider, {
-		transport: "sse",
-		sessionId: "session-3",
+	for (const transport of ["sse", "auto"] as const) {
+		const sessionId = `session-3-${transport}`;
+		const result = await complete(recovery.provider, {
+			transport,
+			sessionId,
+			fetch: async () => {
+				throw fetchError;
+			},
+		});
+
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage ?? "", /fetch failed \(ECONNRESET\)/);
+		const diagnostic = result.diagnostics?.at(-1);
+		assert.equal(diagnostic?.type, "provider_transport_failure");
+		assert.equal(diagnostic?.error?.name, "TransportError");
+		assert.equal(diagnostic?.error?.code, "ECONNRESET");
+		assert.deepEqual(diagnostic?.details?.causeCodes, ["ECONNRESET"]);
+		assert.equal(diagnostic?.details?.configuredTransport, transport);
+		assert.equal(diagnostic?.details?.effectiveTransport, "sse");
+		assert.equal(recovery.getStatus(sessionId).mode, "websocket-preferred");
+		const persisted = JSON.stringify({ errorMessage: result.errorMessage, diagnostics: result.diagnostics });
+		assert.doesNotMatch(persisted, /top-secret|private prompt|Authorization|TOP_SECRET_TOKEN/i);
+	}
+});
+
+test("recovered fetch attempts do not leave diagnostics on successful or unrelated terminal results", async () => {
+	let attempts = 0;
+	const fetchError = new TypeError("fetch failed", {
+		cause: Object.assign(new Error("socket disconnected"), { code: "ECONNRESET" }),
+	});
+	const base = fakeProvider((options, call) => {
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(async () => {
+			try {
+				try {
+					await options?.fetch?.("https://chatgpt.com/backend-api/codex/responses");
+				} catch (error) {
+					assert.match(error instanceof Error ? error.message : String(error), /fetch failed \(ECONNRESET\)/);
+				}
+				await options?.fetch?.("https://chatgpt.com/backend-api/codex/responses");
+				const message = call === 1 ? assistant("stop") : assistant("error", "invalid request");
+				if (message.stopReason === "error") stream.push({ type: "error", reason: "error", error: message });
+				else stream.push({ type: "done", reason: "stop", message });
+			} catch (error) {
+				const message = assistant("error", error instanceof Error ? error.message : String(error));
+				stream.push({ type: "error", reason: "error", error: message });
+			} finally {
+				stream.end();
+			}
+		});
+		return stream;
+	});
+	const recovery = createCodexRecoveryController({}, { baseProvider: base });
+	const options = {
+		transport: "auto" as const,
+		sessionId: "session-fetch-retry",
 		fetch: async () => {
-			throw fetchError;
+			if (++attempts % 2 === 1) throw fetchError;
+			return new Response(null, { status: 200 });
 		},
+	};
+
+	const recovered = await complete(recovery.provider, options);
+	assert.equal(recovered.stopReason, "stop");
+	assert.equal(recovered.diagnostics, undefined);
+	const unrelated = await complete(recovery.provider, options);
+	assert.equal(unrelated.errorMessage, "invalid request");
+	assert.equal(unrelated.diagnostics, undefined);
+	assert.equal(attempts, 4);
+	assert.equal(recovery.getStatus(options.sessionId).mode, "websocket-preferred");
+});
+
+test("an aborted fetch does not add a transport diagnostic or enter cooldown", async () => {
+	const base = fakeProvider((options) => {
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(async () => {
+			try {
+				await options?.fetch?.("https://chatgpt.com/backend-api/codex/responses");
+			} catch (error) {
+				const message = assistant("aborted", error instanceof Error ? error.message : String(error));
+				stream.push({ type: "error", reason: "aborted", error: message });
+			} finally {
+				stream.end();
+			}
+		});
+		return stream;
+	});
+	const recovery = createCodexRecoveryController({}, { baseProvider: base });
+	const result = await complete(recovery.provider, {
+		transport: "auto",
+		sessionId: "session-fetch-abort",
+		fetch: async () => { throw Object.assign(new Error("Request was aborted"), { name: "AbortError" }); },
 	});
 
-	assert.equal(result.stopReason, "error");
-	assert.match(result.errorMessage ?? "", /fetch failed \(ECONNRESET\)/);
-	const diagnostic = result.diagnostics?.at(-1);
-	assert.equal(diagnostic?.type, "provider_transport_failure");
-	assert.equal(diagnostic?.error?.name, "TransportError");
-	assert.equal(diagnostic?.error?.code, "ECONNRESET");
-	assert.deepEqual(diagnostic?.details?.causeCodes, ["ECONNRESET"]);
-	assert.equal(diagnostic?.details?.effectiveTransport, "sse");
-	const persisted = JSON.stringify({ errorMessage: result.errorMessage, diagnostics: result.diagnostics });
-	assert.doesNotMatch(persisted, /top-secret|private prompt|Authorization|TOP_SECRET_TOKEN/i);
+	assert.equal(result.stopReason, "aborted");
+	assert.equal(result.diagnostics, undefined);
+	assert.equal(recovery.getStatus("session-fetch-abort").mode, "websocket-preferred");
 });
 
 test("explicit transport bypasses adaptive decisions and reset clears cooldown", async () => {

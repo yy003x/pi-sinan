@@ -220,10 +220,12 @@ function formatNetworkFailure(failure: NetworkFailure): string {
 	return failure.codes.length > 0 ? `${failure.message} (${failure.codes.join(", ")})` : failure.message;
 }
 
-function withDiagnosticFetch(baseFetch: FetchFunction, capture: (failure: NetworkFailure) => void): FetchFunction {
+function withDiagnosticFetch(baseFetch: FetchFunction, capture: (failure: NetworkFailure | undefined) => void): FetchFunction {
 	return async (input, init) => {
 		try {
-			return await baseFetch(input, init);
+			const response = await baseFetch(input, init);
+			capture(undefined);
+			return response;
 		} catch (error) {
 			if (error instanceof Error && (error.name === "AbortError" || init?.signal?.aborted)) throw error;
 			const failure = collectNetworkFailure(error);
@@ -238,7 +240,7 @@ function appendFetchDiagnostic(
 	failure: NetworkFailure,
 	decision: RequestDecision,
 ): void {
-	if (message.stopReason === "aborted") return;
+	if (message.stopReason !== "error") return;
 	const diagnostic: AssistantMessageDiagnostic = {
 		type: "provider_transport_failure",
 		timestamp: Date.now(),
@@ -249,7 +251,7 @@ function appendFetchDiagnostic(
 		},
 		details: {
 			configuredTransport: decision.configuredTransport,
-			effectiveTransport: decision.effectiveTransport,
+			effectiveTransport: "sse",
 			phase: "before_response_headers",
 			causeCodes: failure.codes,
 		},
