@@ -22,7 +22,7 @@ extensions/
   image.ts            # /sn-image and generate_image
   search.ts           # /sn-search
   usage.ts            # /sn-usage, quota refresh, and Codex reset redemption
-  fast.ts             # /sn-fast OpenAI Codex Fast request toggle
+  fast.ts             # /sn-fast Codex and Grok 4.7 Fast request toggle
   doctor.ts           # /sn-doctor read-only OAuth/endpoint diagnostics
   codex-recovery.ts   # /sn-recovery and OpenAI transport recovery
 ```
@@ -126,17 +126,22 @@ only quota write operation; xAI usage remains read-only.
 - Commands: `/sn-fast` (toggle), `/sn-fast status` (read-only)
 
 Fast mode is off by default. Each `/sn-fast` toggles the request setting and
-reports `off -> on` or `on -> off`. Enabling it requires the official Codex model
-catalog GET to list the selected model slug with `service_tiers.id=priority`.
+reports `off -> on` or `on -> off`. For Codex, enabling it requires the official
+model catalog GET to list the selected model slug with `service_tiers.id=priority`.
 Only supported Codex request payloads receive `service_tier: "priority"`.
-The catalog request uses the verified Codex CLI version `0.156.0` (independent of
-Pi's version); the extension bounds its response to 1 MiB, not an official
-service limit. The catalog and OAuth are revalidated when the model changes
-and before an enabled provider request; unavailable metadata fails closed.
-This requests a tier but cannot prove the server honored it. `pi-sinan/fast-status/v1` emits
-structured local status. The setting is stored in the current Pi session, survives
-reload/resume, and never changes xAI or other providers. Fast availability and
-its higher subscription-credit consumption remain account/model dependent.
+The catalog uses the verified Codex CLI version `0.156.0` (not Pi's version)
+and a local 1 MiB response limit (not an official service limit). For
+`xai/grok-4.7` on Pi's official Responses endpoint with subscription OAuth,
+enabled requests receive `service_tier: "fast"` instead. No xAI catalog or
+entitlement check is available here: the server decides whether
+to accept and honor the requested tier. Other xAI models receive no Fast field.
+The selected model and OAuth are revalidated before each enabled provider request;
+Codex catalog metadata also fails closed when unavailable. This requests a tier
+but does not verify the server honored it or prove equivalence to grok.com's Fast.
+`pi-sinan/fast-status/v1` emits structured local request status (`requestingPriority`
+for Codex, `requestingFast` for Grok 4.7); neither flag confirms server routing.
+The setting is stored in the current Pi session and survives reload/resume.
+Fast availability and higher subscription-credit consumption remain account/model dependent.
 
 ### Doctor
 

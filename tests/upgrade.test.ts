@@ -27,11 +27,11 @@ test("catalog GET uses official origin and OAuth, bounds responses, rejects redi
 	assert.equal(result.status, "supported");
 	const bad = await checkFastAvailability({ ...ctx, model: { ...codex, baseUrl: "https://proxy.example/backend-api" } } as ExtensionContext, async () => { throw new Error("fetch must not run"); });
 	assert.equal(bad.status, "unavailable");
-	const currentSize = await checkFastAvailability(ctx, async () => new Response(JSON.stringify({ models: [
+	const withinLimit = await checkFastAvailability(ctx, async () => new Response(JSON.stringify({ models: [
 		{ slug: "m", service_tiers: [{ id: "priority" }] },
 		{ slug: "other", description: "x".repeat(600 * 1024) },
 	] })));
-	assert.equal(currentSize.status, "supported", "a catalog larger than the old 256 KiB cap must remain usable");
+	assert.equal(withinLimit.status, "supported", "a catalog larger than the old 256 KiB cap must remain usable");
 	let cancelled = false;
 	const oversize = await checkFastAvailability(ctx, async () => new Response(new ReadableStream<Uint8Array>({
 		start(controller) { controller.enqueue(new Uint8Array(1024 * 1024 + 1)); },
@@ -235,6 +235,7 @@ test("doctor all checks both signed-in models without paid POST", async () => {
 	doctorExtension(pi, async () => ({ status: "supported", reason: "catalog" }));
 	await command?.("all", ctx);
 	assert.match(messages.join("\n"), /xai\/grok: OAuth available/);
+	assert.match(messages.join("\n"), /Fast: supported \(catalog\); recovery: no xAI transport adapter/);
 	assert.match(messages.join("\n"), /openai-codex\/m: OAuth available/);
 	assert.doesNotMatch(messages.join("\n"), /secret/);
 });

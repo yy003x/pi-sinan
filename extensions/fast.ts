@@ -12,12 +12,12 @@ export default function fastExtension(pi: ExtensionAPI, check: typeof checkFastA
 	const publish = (ctx: ExtensionContext) => {
 		const active = enabled && availability.status === "supported" && modelKey === key(ctx);
 		ctx.ui.setStatus(FAST_STATUS_KEY, active ? "fast requested" : undefined);
-		pi.events.emit(FAST_STATUS_EVENT, { v: 1, enabled, availability: modelKey === key(ctx) ? availability.status : "unavailable", model: key(ctx), requestingPriority: active });
+		pi.events.emit(FAST_STATUS_EVENT, { v: 1, enabled, availability: modelKey === key(ctx) ? availability.status : "unavailable", model: key(ctx), requestingPriority: active && ctx.model?.provider === "openai-codex", requestingFast: active && ctx.model?.provider === "xai" });
 	};
 	const validate = async (ctx: ExtensionContext) => {
 		const current = ++generation;
 		const selected = key(ctx);
-		availability = { status: "unavailable", reason: "Checking official catalog." };
+		availability = { status: "unavailable", reason: "Checking Fast request eligibility." };
 		modelKey = selected;
 		publish(ctx);
 		const result = await check(ctx);
@@ -31,27 +31,26 @@ export default function fastExtension(pi: ExtensionAPI, check: typeof checkFastA
 		void validate(ctx);
 	};
 	pi.on("before_provider_request", async (event, ctx) => {
-		if (!enabled || ctx.model?.provider !== "openai-codex") return event.payload;
-		// The payload hook is global; a selected model can differ from the
-		// request currently being serialized. Never inject into an unknown model.
+		if (!enabled || (ctx.model?.provider !== "openai-codex" && ctx.model?.provider !== "xai")) return event.payload;
+		// 全局请求钩子可能收到与当前选中模型不同的请求，禁止向其他模型注入字段。
 		if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload) ||
 			(event.payload as { model?: unknown }).model !== ctx.model.id) return event.payload;
-		// Recheck OAuth and official model metadata at request time: accounts may switch without model_select.
+		// 每次请求重新校验账号和模型；Codex 额外要求官方目录中的 priority 元数据。
 		const selected = key(ctx);
 		const checked = await validate(ctx);
-		if (selected !== key(ctx) || checked?.status !== "supported" || !checked.fingerprint || modelKey !== selected) return event.payload;
-		return addFastServiceTier(event.payload, true, ctx.model?.provider);
+		if (selected !== key(ctx) || checked?.status !== "supported" || (ctx.model?.provider === "openai-codex" && !checked.fingerprint) || modelKey !== selected) return event.payload;
+		return addFastServiceTier(event.payload, true, ctx.model.provider);
 	});
 	pi.on("session_start", (_event, ctx) => restore(ctx));
 	pi.on("session_tree", (_event, ctx) => restore(ctx));
 	pi.on("model_select", (_event, ctx) => { void validate(ctx); });
 	pi.on("session_shutdown", (_event, ctx) => { generation++; ctx.ui.setStatus(FAST_STATUS_KEY, undefined); });
 	pi.registerCommand("sn-fast", {
-		description: "Toggle officially catalog-supported Codex Fast requests: /sn-fast [status]",
+		description: "Toggle Codex priority or xAI Grok 4.7 fast requests: /sn-fast [status]",
 		handler: async (args, ctx) => {
 			const action = args.trim().toLowerCase();
 			if (action !== "" && action !== "status") { ctx.ui.notify("Usage: /sn-fast [status]", "warning"); return; }
-			if (action === "status") { await validate(ctx); ctx.ui.notify(`Fast ${enabled ? "on" : "off"}; ${availability.status}: ${availability.reason} Requesting priority never guarantees server routing.`, "info"); return; }
+			if (action === "status") { await validate(ctx); ctx.ui.notify(`Fast ${enabled ? "on" : "off"}; ${availability.status}: ${availability.reason} A request does not confirm server routing.`, "info"); return; }
 			const next = !enabled;
 			if (next) {
 				await validate(ctx);
@@ -61,7 +60,7 @@ export default function fastExtension(pi: ExtensionAPI, check: typeof checkFastA
 			enabled = next;
 			pi.appendEntry(FAST_STATE_ENTRY, { enabled });
 			publish(ctx);
-			ctx.ui.notify(`OpenAI Codex Fast: ${previous} -> ${enabled ? "on" : "off"}; ${enabled ? "Fast may consume subscription credits faster; " : ""}server routing is not guaranteed.`, "info");
+			ctx.ui.notify(`${ctx.model?.provider === "xai" ? "Grok 4.7" : "OpenAI Codex"} Fast: ${previous} -> ${enabled ? "on" : "off"}; ${enabled ? "Fast may consume subscription credits faster; " : ""}server routing is not confirmed.`, "info");
 		},
 	});
 }

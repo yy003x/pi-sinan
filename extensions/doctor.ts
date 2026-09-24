@@ -44,7 +44,10 @@ export default function doctorExtension(pi: ExtensionAPI, fastCheck: typeof chec
 					const status = oauth ? await fastCheck({ ...ctx, model } as ExtensionContext) : { status: "unavailable", reason: "Official OAuth unavailable." };
 					const recovery = codexRecoveryDiagnostic(ctx.sessionManager.getSessionId());
 					lines.push(`Fast: ${status.status} (${status.reason}); recovery: ${recovery ? safeRecoveryStatusText(recovery) : "adapter unavailable"}`);
-				} else lines.push("recovery: no xAI transport adapter");
+				} else {
+					const status = oauth ? await fastCheck({ ...ctx, model } as ExtensionContext) : { status: "unavailable", reason: "Official OAuth unavailable." };
+					lines.push(`Fast: ${status.status} (${status.reason}); recovery: no xAI transport adapter`);
+				}
 			}
 			ctx.ui.notify(lines.join("\n"), "info");
 		},

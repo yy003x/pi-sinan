@@ -1,6 +1,7 @@
 export const FAST_STATE_ENTRY = "pi-sinan-fast-state";
 export const FAST_STATUS_KEY = "pi-sinan-fast";
 export const FAST_SERVICE_TIER = "priority";
+export const XAI_FAST_SERVICE_TIER = "fast";
 
 export interface FastStateEntry {
 	type: "custom";
@@ -21,8 +22,13 @@ export function fastStateFromEntries(entries: readonly unknown[]): boolean {
 }
 
 export function addFastServiceTier(payload: unknown, enabled: boolean, providerId: string | undefined): unknown {
-	if (!enabled || providerId !== "openai-codex" || !payload || typeof payload !== "object" || Array.isArray(payload)) {
-		return payload;
+	if (!enabled || !payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+	const model = (payload as { model?: unknown }).model;
+	if (providerId === "xai" && model === "grok-4.7") {
+		return { ...(payload as Record<string, unknown>), service_tier: XAI_FAST_SERVICE_TIER };
 	}
-	return { ...(payload as Record<string, unknown>), service_tier: FAST_SERVICE_TIER };
+	if (providerId === "openai-codex") {
+		return { ...(payload as Record<string, unknown>), service_tier: FAST_SERVICE_TIER };
+	}
+	return payload;
 }

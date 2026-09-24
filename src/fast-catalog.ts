@@ -21,7 +21,21 @@ export function catalogSupportsFast(payload: unknown, slug: string): boolean | u
 
 export async function checkFastAvailability(ctx: ExtensionContext, fetchImpl: typeof fetch = fetch): Promise<FastAvailability> {
 	const model = ctx.model;
-	if (!model || model.provider !== "openai-codex" || model.api !== "openai-codex-responses") return { status: "unavailable", reason: "Select an OpenAI Codex Responses model." };
+	if (model?.provider === "xai") {
+		if (model.id !== "grok-4.7" || model.api !== "openai-responses") return { status: "unavailable", reason: "Select xai/grok-4.7 Responses." };
+		try {
+			const url = new URL(model.baseUrl);
+			if (url.protocol !== "https:" || url.host !== "api.x.ai" || url.username || url.password || url.search || url.hash || url.pathname.replace(/\/+$/, "") !== "/v1" || !ctx.modelRegistry.isUsingOAuth(model)) {
+				return { status: "unavailable", reason: "Official xAI OAuth Responses model required." };
+			}
+			const auth = (await ctx.modelRegistry.getProviderAuth("xai"))?.auth;
+			if (!auth?.apiKey || (auth.baseUrl && !["https://api.x.ai/v1", "https://api.x.ai/v1/"].includes(auth.baseUrl))) {
+				return { status: "unavailable", reason: "Official xAI OAuth credential unavailable." };
+			}
+			return { status: "supported", reason: "xAI OAuth Grok 4.7 can request fast; server acceptance is unverified." };
+		} catch { return { status: "unavailable", reason: "xAI OAuth validation failed." }; }
+	}
+	if (!model || model.provider !== "openai-codex" || model.api !== "openai-codex-responses") return { status: "unavailable", reason: "Select an OpenAI Codex or xai/grok-4.7 Responses model." };
 	try {
 		const url = new URL(model.baseUrl);
 		if (url.protocol !== "https:" || url.host !== "chatgpt.com" || url.username || url.password || !["/backend-api", "/backend-api/codex"].includes(url.pathname.replace(/\/+$/, "")) || !ctx.modelRegistry.isUsingOAuth(model)) {
